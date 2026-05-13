@@ -1,21 +1,35 @@
-# timing-analyzer — третий скилл pipeline
+# timing-analyzer v3.1 — третий скилл pipeline
 
 Считает **факт А/Р/Т в календарных днях** для активных задач через анализ истории переходов статусов (changelog).
+
+## Изменения v3.1 vs v3.0
+
+- ✅ **Архитектурный фикс:** агент передаёт сырой ответ MCP через stdin в helper, helper применяет алгоритм `compute_timing`. Никаких MCP-вызовов из Python.
+- ✅ Папка `pipeline/` (видимая)
+- ✅ Создаётся `pipeline/step-3-after-timing-analyzer.md` с топ-10 самых долгих фаз
+- ✅ Готовый код `helper.py` в SPEC.md раздел 5 (включая алгоритм `build_timeline` и `aggregate_phase_days`)
+- ✅ CLI с подкомандами: `list-active`, `fill-inactive`, `compute-from-response`, `merge-batch`, `finalize`, `write-step3`
+- ✅ Алгоритм построения timeline валидирован на mock changelog: для задачи в Backlog 3.9 д → In Progress 2.3 д → Ready for QA 12 д даёт правильные phase_days
 
 ## Место в pipeline
 
 ```
-1. excel-parser       → .cache/enriched.json (план)
-2. jira-enricher      → .cache/enriched.json (+статус, +эпик, +команда)
-3. timing-analyzer    ← вы здесь (+факт А/Р/Т)
+1. excel-parser
+2. jira-enricher
+3. timing-analyzer    ← вы здесь
 4. report-builder
 ```
 
-## Что нового в этом скилле
+## Главное про этот скилл
 
-В отличие от `jira-enricher`, этот скилл запрашивает у Jira **changelog** (историю изменений). Из него парсит **переходы статусов** с timestamps, строит timeline, агрегирует календарные дни по фазам А/Р/Т.
+Это **единственный скилл который реально считает факт работы** над задачей. Работает только для **активных** задач (статус не Done, не Backlog) — для них факт интересен.
 
-**Главное:** обрабатывает **только активные** задачи (статус не Done, не Backlog) — для них факт интересен. Не активные получают тривиальный пустой timing.
+Что значит "факт А/Р/Т в календарных днях":
+- Это **не чел-дни.** Это календарное время в статусах соответствующей фазы.
+- Включает выходные, ожидания, переключения разработчика.
+- Сравнение факт vs план — это **сигнал** "стоит проверить", не точная метрика.
+
+Эти оговорки попадут в дисклеймер `report.md`.
 
 ## Подготовка
 
@@ -25,9 +39,9 @@
 "includeTools": ["jira_get_issue"]
 ```
 
-`jira_search` уже не нужен — это была работа предыдущего скилла.
+(`jira_search` уже не нужен — это была работа `jira-enricher`.)
 
-Должны отработать `excel-parser` и `jira-enricher`. Файл `.cache/enriched.json` должен содержать `["excel-parser", "jira-enricher"]` в `metadata.skills_completed`.
+Должны отработать `excel-parser` и `jira-enricher`.
 
 ## Запуск
 
@@ -38,24 +52,25 @@ cd timing-analyzer
 gigacode
 ```
 
-Вставить промпт из `PROMPT.md`. Получить `skill/timing-analyzer/SKILL.md` + `helper.py`.
+Вставить промпт из `PROMPT.md`.
 
-Перед установкой проверить:
-- 2 файла в `skill/timing-analyzer/`
-- В SKILL.md вызов jira_get_issue **С** параметром `expand="changelog"`
-- В SKILL.md нет запроса changelog для неактивных задач (фильтр через helper.is_active)
-- helper.py содержит функции `extract_status_transitions`, `build_timeline`, `aggregate_phase_days`
-- Алгоритм построения timeline в helper.py соответствует разделу 7 SPEC.md
+### Шаг 2. Проверить перед установкой
 
-### Шаг 2. Установить
+В `skill/timing-analyzer/` — ровно 2 файла:
+
+- В SKILL.md tool call jira_get_issue **С** параметром `expand="changelog"`
+- В SKILL.md фильтр `is_active` применяется ДО tool call — изначально получаем список активных задач через `helper.py list-active`
+- В helper.py есть функции `extract_status_transitions`, `build_timeline`, `aggregate_phase_days`, `compute_timing`
+- Алгоритм построения timeline в `build_timeline` соответствует SPEC.md раздел 5
+- В SKILL.md передача через stdin: `echo '...' | python3 helper.py compute-from-response`
+- В helper.py **НЕТ** строк типа `mcp__Atlassian__jira_get_issue` — это NameError
+- `parse_iso` учитывает часовые пояса (формат `+0300` конвертирует в `+03:00`)
+- НЕТ запроса changelog для неактивных задач (для них вызывается `fill-inactive`)
+
+### Шаг 3. Установить и запустить
 
 ```bash
 cp -r skill/timing-analyzer ~/.gigacode/skills/
-```
-
-### Шаг 3. Запустить
-
-```bash
 gigacode
 ```
 
@@ -63,20 +78,23 @@ gigacode
 
 ## Сколько времени занимает
 
-Зависит от количества активных задач:
 - Из 28 задач Натальи активных обычно 8-12
-- Каждая = 1 jira_get_issue с changelog + 0.1 сек пауза = ~10-15 сек
-- Расчёт timing локально через helper — мгновенно
+- Каждая = 1 jira_get_issue с changelog + пауза 0.2 сек = ~5-10 сек
+- Расчёт через helper мгновенный
 
 Итого 15-30 секунд.
 
 ## Проверка результата
 
 ```bash
+cat pipeline/step-3-after-timing-analyzer.md | head -20
+```
+
+```bash
 python3 -c "
 import json
-d = json.load(open('.cache/enriched.json'))
-active = [t for t in d['tasks'] if t.get('timing', {}).get('computed')]
+d = json.load(open('pipeline/enriched.json'))
+active = [t for t in d['tasks'] if (t.get('timing') or {}).get('computed')]
 print('Активных с timing:', len(active))
 print()
 for t in active[:5]:
@@ -91,19 +109,18 @@ for t in active[:5]:
 
 CRSIGMA-23749         A=  30.5  R= 240.2  T=   0.0
 ASFC-35817            A=  98.0  R= 700.5  T=   0.0
-ASFC-51561            A= 363.2  R=   0.0  T=   0.0
 ...
 ```
 
-## Что значит "факт А/Р/Т в календарных днях"
+## Если что-то пошло не так
 
-**Это НЕ чел-дни.** Это **календарное время** проведённое задачей в статусах соответствующей фазы.
-
-Например, `CRSIGMA-23749` с факт R = 240 дней означает: задача суммарно провела 240 календарных дней в статусе `In Progress` (с момента первого перехода туда до сейчас или до выхода в другую фазу). Это включает выходные, ожидания, переключения разработчика на другие задачи.
-
-Сравнение факт vs план тогда — это **сигнал** "стоит проверить эту задачу", а не точная метрика переработки.
-
-Все эти оговорки попадут в дисклеймер итогового отчёта (это работа `report-builder`).
+| Симптом | Действие |
+|---------|----------|
+| `NameError: mcp__Atlassian__jira_get_issue` | Скилл вызывает MCP из Python — перегенерировать |
+| Все timing = 0 / null | Алгоритм не работает, проверить `build_timeline` в helper.py |
+| Запрашивает changelog для всех 28 задач (долго) | Не использует `is_active` фильтр — перегенерировать |
+| Phase_days содержат отрицательные числа | Сортировка transitions не работает — проверить `extract_status_transitions` |
+| Часовые пояса игнорируются | `parse_iso` не учитывает offset — проверить регулярку |
 
 ## Следующий шаг
 

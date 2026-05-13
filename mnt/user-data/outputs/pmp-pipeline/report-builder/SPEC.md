@@ -1,345 +1,490 @@
-# SPEC: report-builder
+# SPEC: report-builder (v3.1)
 
-> Четвёртый и последний скилл pipeline. Читает `.cache/enriched.json` со всеми обогащениями, генерирует финальный markdown-отчёт `report.md` в рабочей директории.
+> Четвёртый и последний скилл pipeline. Читает `pipeline/enriched.json` со всеми обогащениями, генерирует финальный markdown-отчёт `report.md` в корне рабочей директории.
 >
-> Никаких MCP-вызовов. Никакой Excel-работы. Только формирование текста из готовых данных.
+> Никаких MCP-вызовов. Никакой Excel-работы. Только формирование текста из готовых данных. Самый простой скилл pipeline.
 
 ## 1. Место в pipeline
 
 ```
 1. excel-parser
 2. jira-enricher
-3. timing-analyzer            → .cache/enriched.json со всеми обогащениями
-4. report-builder  ◄── (этот скилл)              → report.md
+3. timing-analyzer (опционально)    → pipeline/enriched.json
+4. report-builder  ◄── (этот скилл)  → report.md
 ```
 
 ## 2. Цели
 
-- Прочитать `.cache/enriched.json`
-- Валидировать что хотя бы `excel-parser` и `jira-enricher` отработали (timing-analyzer опционален)
-- Сгенерировать markdown отчёт со 7 секциями
-- Сохранить в `report.md` в рабочей директории
-- Вывести краткую сводку пользователю в чат
+- Прочитать `pipeline/enriched.json`
+- Валидировать что хотя бы `excel-parser` и `jira-enricher` отработали
+- Сгенерировать markdown-отчёт со 7 секциями
+- Сохранить в `report.md` в **корне** рабочей директории (не в `pipeline/` — это финальный отчёт для пользователя)
+- Вывести краткую сводку в чат
 
 ## 3. Анти-цели
 
 - **НЕ** ходить в Jira (все данные уже в enriched.json)
 - **НЕ** читать Excel (всё уже распарсено)
-- **НЕ** изменять `.cache/enriched.json` (этот скилл write-only для report.md)
+- **НЕ** изменять `pipeline/enriched.json` (этот скилл write-only для report.md, но может проставить `report_generated_at` в metadata)
 - **НЕ** делать долгих вычислений — данные уже агрегированы
 
-## 4. Вход и выход
+## 4. Условный рендеринг
 
-### Вход
+Скилл работает в **двух режимах** в зависимости от того что в `enriched.json`:
 
-`.cache/enriched.json` в рабочей директории. Требования:
-- `metadata.skills_completed` содержит как минимум `["excel-parser", "jira-enricher"]`
-- Если `timing-analyzer` не отработал — генерируем отчёт **без колонок Факт А/Р/Т** и **без секции "Застрявшие"** (но с явной пометкой в дисклеймере)
+**Полный режим** (если timing-analyzer отработал):
+- Все 7 секций
+- Колонки "Факт А/Р/Т"
+- Секция "Застрявшие"
 
-### Выход
+**Без timing режим** (если timing-analyzer не запускался):
+- 6 секций (без "Застрявшие")
+- Без колонок "Факт А/Р/Т"
+- В дисклеймере явная пометка "для расчёта факта запустите timing-analyzer"
 
-`report.md` в рабочей директории. UTF-8, без BOM.
+## 5. Готовый код helper.py
 
-## 5. Структура отчёта
-
-7 секций в строгом порядке:
-
-```markdown
-# PMP vs Jira — состояние портфеля Q2
-
-**Источник плана:** Бэклог и цели.xlsx, лист Q2_26_оценки_new_name
-**Источник данных Jira:** mcp-jira (https://jira.delta.sbrf.ru)
-**Дата сборки:** YYYY-MM-DD HH:MM
-
-## Что в отчёте и чего нет
-
-Этот отчёт сравнивает план Натальи (Excel) с реальными данными Jira.
-
-**Что показано:**
-- Статус каждой задачи (текущий)
-- Эпик к которому привязана задача
-- Команда (из customfield_22200 Jira, либо ответственный)
-- Lead time — календарные дни жизни задачи
-- [ЕСЛИ есть timing] **Факт А/Р/Т в календарных днях** — время которое задача провела в фазе Аналитика / Разработка / Тестирование
-- Маркеры состояния (✓ закрыта, ⏳ в работе, ⚠ долго в фазе, ⏸ не начата)
-- Срезы по эпикам и командам
-
-**Что НЕ показано:**
-- Точный факт в чел-днях — недоступен (worklog не ведётся командой)
-- Календарные дни ≠ чел-дни (включают выходные, ожидания, переключения)
-- Маркер "⚠ долго в фазе" — это сигнал "стоит проверить", а не "точно перелимит"
-- [ЕСЛИ нет timing] Колонок Факт А/Р/Т нет — для их добавления запустите timing-analyzer
-
-## 1. Общая сводка
-
-| Показатель | Значение |
-|---|---|
-| Задач в плане | N |
-| С заполненным CR | N |
-| Найдено в Jira | N |
-| Не найдено в Jira | N |
-| Без оценок А/Р/Т в плане | N |
-| Закрытых | N |
-| В работе | N |
-| Не начатых | N |
-| Застрявших (⚠) | N |
-| Уникальных эпиков | N |
-
-## 2. Основная таблица
-
-[ВАРИАНТ если timing-analyzer отработал]:
-
-| # | Ключ | Название | Эпик | Команда | План А/Р/Т (чд) | Факт А/Р/Т (д) | Lead time | Статус | Маркер |
-|---|------|----------|------|---------|------------------|----------------|-----------|--------|--------|
-...
-
-[ВАРИАНТ без timing]:
-
-| # | Ключ | Название | Эпик | Команда | План А/Р/Т (чд) | Lead time | Статус | Фаза | Маркер |
-|---|------|----------|------|---------|------------------|-----------|--------|------|--------|
-...
-
-## 3. Срез по эпикам
-
-| Эпик | Имя | Задач из плана | Всего дочерних в Jira | План Σ (чд) | Застряло из плана |
-|------|-----|----------------|-----------------------|-------------|---------------------|
-...
-
-Только эпики которые встречаются в плане Натальи. Сортировка — по убыванию "Задач из плана".
-
-Отдельной строкой — задачи без эпика: `| — | (эпик не привязан) | N | — | Σ | M |`
-
-## 4. Срез по командам
-
-| Команда (источник) | Задач из плана | План Σ (чд) | В работе | Закрыто | Застряло |
-|---|-----|-----|-----|-----|-----|
-...
-
-Источник команды указывается явно:
-- `PALM.CSP.K7M` — из customfield_22200
-- `(по assignee) Иванов И.И.` — fallback
-- `—` — нет ни того, ни другого
-
-## 5. Застрявшие (⚠)
-
-[Эта секция только если timing-analyzer отработал]
-
-Задачи с маркером ⚠ долго в фазе. Сортировка — по убыванию превышения.
-
-| Ключ | Название | Эпик | Фаза | План (чд) | Факт (д) | Превышение | Статус |
-|------|----------|------|------|-----------|----------|------------|--------|
-...
-
-## 6. Не найдено в Jira
-
-Задачи из плана чьи CR-ключи отсутствуют в Jira (jira.found == false):
-- (список)
-
-Или: *Все задачи плана найдены в Jira.*
-
-## 7. Без плана
-
-Задачи из Excel с пустыми оценками А/Р/Т:
-- (список)
-
-Или: *Все задачи имеют заполненный план.*
-
----
-
-*Отчёт сгенерирован скиллом report-builder (pipeline pmp-vs-jira).*
-*Дисклеймер из секции "Что в отчёте и чего нет" применим ко всем числам факта.*
-*Pipeline: excel-parser → jira-enricher → timing-analyzer → report-builder*
-```
-
-## 6. Правила формирования таблиц
-
-### 6.1. Нормализация текста
-
-Применяется к каждой ячейке с текстом:
-1. Заменить `\n`, `\r`, `\t` на пробел
-2. Свернуть множественные пробелы в один
-3. Strip по краям
-4. Обрезка по словам с многоточием `…`:
-   - "Название" в основной: **50 символов**
-   - "Название" в "Застрявших": **50 символов**
-   - "Эпик" (имя): **25 символов**
-   - "Имя" в срезе по эпикам: **60 символов**
-   - "Команда": без обрезки (короткое)
-
-Обрезка по словам — отрезать на последнем пробеле до лимита, добавить `…`. Пример: `"Реализована ДК по повышению уровня"` с лимитом 30 → `"Реализована ДК по повышению…"` (НЕ `"Реализована ДК по повышению у"`).
-
-Реализуется в `helper.py` функция `truncate_words(text, limit)`.
-
-### 6.2. Эпик в основной таблице
-
-Формат: `<ключ> <имя_до_25_симв>`. Например:
-- `ASFC-65543 ЦКП.ПГ-1 универс…` 
-- `ASFC-45037 Единый калькулятор…`
-- `—` если эпик не найден
-
-Если у эпика `name = null` — показывать только ключ.
-
-### 6.3. План А/Р/Т
-
-Формат: `23/23/15`. Если оценок нет — `—`.
-
-### 6.4. Факт А/Р/Т (если есть timing)
-
-Формат: `30/240/0` (целые дни). Округление к ближайшему. Если `timing.computed = false` — `—`.
-
-### 6.5. Маркеры
-
-| Маркер | Условие |
-|--------|---------|
-| `✓` закрыта | `jira.status_category == "finished"` |
-| `⏳` в работе | active, и нет превышения по фазам (или timing нет) |
-| `⚠ долго в А` | active в фазе A, факт A > план A × 2 |
-| `⚠ долго в Р` | active в фазе R, факт R > план R × 2 |
-| `⚠ долго в Т` | active в фазе T, факт T > план T × 2 |
-| `❗ Need Info` | `status == "Need Info"` (всегда сигнал) |
-| `⏸` не начата | `status_category == "not_started"` |
-| `❗ нестандартный` | `status_category == "unknown"` |
-| `✗` не найдена | `jira.found == false` |
-| `?` нет плана | `plan.total == null` |
-
-Реализуется в `helper.py` функция `compute_marker(task, timing_available)`.
-
-## 7. Steps
-
-### Step 1. Валидация и загрузка
-
-Прочитать `.cache/enriched.json`. Если не существует — сообщить, попросить запустить excel-parser/jira-enricher, завершить.
-
-Проверить `metadata.skills_completed`:
-- Должны быть `["excel-parser", "jira-enricher"]` минимум
-- Если `"timing-analyzer"` есть — флаг `timing_available = True`, иначе `False`
-
-### Step 2. Подсчитать сводку
-
-Через `helper.py` функция `compute_summary(enriched, timing_available)`:
-- Количества по категориям (closed, in_progress, not_started, not_found, no_plan)
-- Если timing есть — количество застрявших
-
-### Step 3. Сформировать основную таблицу
-
-Через `helper.py` функция `format_main_table(tasks, epics_dict, timing_available)`:
-- Для каждой задачи — строка таблицы со всеми колонками
-- Применить нормализацию текста
-- Поставить маркер
-
-Если `timing_available` — добавить колонку "Факт А/Р/Т".
-
-### Step 4. Срез по эпикам
-
-Из `enriched.epics` сформировать таблицу. Подсчитать "Застряло из плана" локально:
 ```python
-def stuck_in_plan(epic_key, tasks):
-    return sum(1 for t in tasks 
-               if t.get('jira', {}).get('epic', {}).get('key') == epic_key 
-               and is_stuck(t))
+# helper.py для report-builder
+
+import json
+import sys
+import re
+import os
+from datetime import datetime, timezone
+
+# === Утилиты для формирования отчёта ===
+
+def truncate_words(text, limit):
+    """Обрезать по словам, добавить … если длиннее."""
+    if not text:
+        return ''
+    text = str(text).replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+    text = re.sub(r'\s+', ' ', text).strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(' ', 1)[0]
+    return cut + '…'
+
+def now_iso():
+    return datetime.now(timezone.utc).astimezone().isoformat()
+
+# === Маркеры ===
+
+def compute_marker(task, timing_available):
+    """Рассчитать маркер состояния для задачи."""
+    jira = task.get('jira') or {}
+    
+    if not jira.get('found'):
+        return '✗ не найдена'
+    
+    cat = jira.get('status_category')
+    status = jira.get('status', '')
+    plan = task.get('plan') or {}
+    
+    if cat == 'finished':
+        return '✓'
+    if cat == 'not_started':
+        return '⏸'
+    if cat == 'unknown':
+        return '❗ нестандартный'
+    if status == 'Need Info':
+        return '❗ Need Info'
+    
+    # Проверка превышения по фазе (только если есть timing)
+    if timing_available:
+        timing = task.get('timing') or {}
+        if timing.get('computed'):
+            phase_days = timing.get('phase_days') or {}
+            phase = jira.get('phase')
+            if phase:
+                fact = phase_days.get(phase, 0)
+                plan_phase_key = {'A': 'analytics', 'R': 'development', 'T': 'testing'}[phase]
+                plan_value = plan.get(plan_phase_key)
+                if plan_value and plan_value > 0:
+                    if fact > plan_value * 2:
+                        return f'⚠ долго в {phase}'
+                elif fact > 14:  # план = 0, факт большой
+                    return f'⚠ долго в {phase}'
+    
+    return '⏳'
+
+# === Подсчёт сводки ===
+
+def compute_summary(enriched, timing_available):
+    """Подсчитать поля общей сводки."""
+    tasks = enriched['tasks']
+    summary = {
+        'total': len(tasks),
+        'with_cr': sum(1 for t in tasks if t.get('cr_key')),
+        'found_in_jira': sum(1 for t in tasks if (t.get('jira') or {}).get('found')),
+        'not_found_in_jira': sum(1 for t in tasks 
+                                    if t.get('jira') and not t['jira'].get('found')),
+        'no_plan': sum(1 for t in tasks 
+                         if not (t.get('plan') or {}).get('total')),
+        'closed': sum(1 for t in tasks 
+                        if (t.get('jira') or {}).get('status_category') == 'finished'),
+        'in_progress': sum(1 for t in tasks 
+                             if (t.get('jira') or {}).get('status_category') 
+                             in ('analysis', 'development', 'testing')),
+        'not_started': sum(1 for t in tasks 
+                             if (t.get('jira') or {}).get('status_category') == 'not_started'),
+        'epics_unique': len(enriched.get('epics', [])),
+    }
+    if timing_available:
+        summary['stuck'] = sum(1 for t in tasks 
+                                 if '⚠' in compute_marker(t, True))
+    return summary
+
+# === Главная функция: построить отчёт ===
+
+def build_report(enriched_path='pipeline/enriched.json',
+                  report_path='report.md'):
+    with open(enriched_path, 'r', encoding='utf-8') as f:
+        enriched = json.load(f)
+    
+    timing_available = 'timing-analyzer' in enriched['metadata'].get('skills_completed', [])
+    summary = compute_summary(enriched, timing_available)
+    tasks = enriched['tasks']
+    epics = enriched.get('epics', [])
+    
+    md = []
+    
+    # Заголовок
+    md.append("# PMP vs Jira — состояние портфеля Q2\n")
+    md.append(f"**Источник плана:** {enriched['metadata']['source_file']}, лист {enriched['metadata']['sheet']}\n")
+    md.append(f"**Источник данных Jira:** mcp-jira (https://jira.delta.sbrf.ru)\n")
+    md.append(f"**Дата сборки:** {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
+    
+    # Дисклеймер
+    md.append("\n## Что в отчёте и чего нет\n")
+    md.append("Этот отчёт сравнивает план Натальи (Excel) с реальными данными Jira.\n")
+    md.append("\n**Что показано:**")
+    md.append("- Статус каждой задачи (текущий)")
+    md.append("- Эпик к которому привязана задача")
+    md.append("- Команда (из customfield_22200 Jira, либо ответственный)")
+    md.append("- Lead time — календарные дни жизни задачи")
+    if timing_available:
+        md.append("- **Факт А/Р/Т в календарных днях** — время которое задача провела в каждой фазе")
+        md.append("- Маркер ⚠ долго в фазе для задач где факт превышает план более чем в 2 раза")
+    md.append("- Срезы по эпикам и командам\n")
+    md.append("\n**Что НЕ показано:**")
+    md.append("- Точный факт в чел-днях — недоступен (worklog не ведётся командой)")
+    if timing_available:
+        md.append("- Календарные дни ≠ чел-дни (включают выходные, ожидания, переключения)")
+        md.append("- Маркер ⚠ — это сигнал \"стоит проверить\", а не \"точно перелимит\"")
+    else:
+        md.append("- **Факт А/Р/Т недоступен в этом отчёте** — для его расчёта запустите `timing-analyzer` и пересоберите отчёт")
+    md.append("")
+    
+    # 1. Сводка
+    md.append("\n## 1. Общая сводка\n")
+    md.append("| Показатель | Значение |")
+    md.append("|---|---|")
+    md.append(f"| Задач в плане | {summary['total']} |")
+    md.append(f"| С заполненным CR | {summary['with_cr']} |")
+    md.append(f"| Найдено в Jira | {summary['found_in_jira']} |")
+    md.append(f"| Не найдено в Jira | {summary['not_found_in_jira']} |")
+    md.append(f"| Без оценок А/Р/Т в плане | {summary['no_plan']} |")
+    md.append(f"| Закрытых | {summary['closed']} |")
+    md.append(f"| В работе | {summary['in_progress']} |")
+    md.append(f"| Не начатых | {summary['not_started']} |")
+    if timing_available:
+        md.append(f"| Застрявших (⚠) | {summary.get('stuck', 0)} |")
+    md.append(f"| Уникальных эпиков | {summary['epics_unique']} |")
+    
+    # 2. Основная таблица
+    md.append("\n## 2. Основная таблица\n")
+    
+    if timing_available:
+        md.append("| # | Ключ | Название | Эпик | Команда | План А/Р/Т (чд) | Факт А/Р/Т (д) | Lead time | Статус | Маркер |")
+        md.append("|---|------|----------|------|---------|------------------|----------------|-----------|--------|--------|")
+    else:
+        md.append("| # | Ключ | Название | Эпик | Команда | План А/Р/Т (чд) | Lead time | Статус | Фаза | Маркер |")
+        md.append("|---|------|----------|------|---------|------------------|-----------|--------|------|--------|")
+    
+    for i, task in enumerate(tasks, 1):
+        cr = task['cr_key']
+        name = truncate_words(task.get('task_name'), 50)
+        
+        jira = task.get('jira') or {}
+        epic = jira.get('epic') or {}
+        epic_str = '—'
+        if epic.get('key'):
+            ename = truncate_words(epic.get('name') or '', 25)
+            epic_str = f"{epic['key']} {ename}".strip()
+        
+        team_obj = jira.get('team') or {}
+        team_val = team_obj.get('value') or '—'
+        if team_obj.get('source') == 'assignee_fallback':
+            team_val = f"(по assignee) {team_val}"
+        
+        plan = task.get('plan') or {}
+        if plan.get('total') is None:
+            plan_str = '—'
+        else:
+            def fmt(v): return str(int(v)) if v is not None else '0'
+            plan_str = f"{fmt(plan.get('analytics'))}/{fmt(plan.get('development'))}/{fmt(plan.get('testing'))}"
+        
+        lead = jira.get('lead_time_days')
+        lead_str = f"{lead} д" if lead is not None else '—'
+        
+        status = jira.get('status', '—')
+        marker = compute_marker(task, timing_available)
+        
+        if timing_available:
+            timing = task.get('timing') or {}
+            if timing.get('computed'):
+                pd = timing['phase_days']
+                fact_str = f"{int(pd['A'])}/{int(pd['R'])}/{int(pd['T'])}"
+            else:
+                fact_str = '—'
+            md.append(f"| {i} | {cr} | {name} | {epic_str} | {team_val} | {plan_str} | {fact_str} | {lead_str} | {status} | {marker} |")
+        else:
+            phase = jira.get('phase') or '—'
+            md.append(f"| {i} | {cr} | {name} | {epic_str} | {team_val} | {plan_str} | {lead_str} | {status} | {phase} | {marker} |")
+    
+    # 3. Срез по эпикам
+    md.append("\n## 3. Срез по эпикам\n")
+    
+    if epics:
+        md.append("| Эпик | Имя | Задач из плана | Всего дочерних в Jira | План Σ (чд) |")
+        md.append("|------|-----|----------------|-----------------------|-------------|")
+        sorted_epics = sorted(epics, key=lambda e: len(e.get('tasks_from_plan', [])), reverse=True)
+        for e in sorted_epics:
+            ename = truncate_words(e.get('name') or '', 60)
+            from_plan_keys = e.get('tasks_from_plan', [])
+            from_plan = len(from_plan_keys)
+            total_children = e.get('children_count_total', '—')
+            # Сумма плана для задач из плана этого эпика
+            plan_sum = 0
+            for t in tasks:
+                if t['cr_key'] in from_plan_keys:
+                    p = (t.get('plan') or {}).get('total') or 0
+                    plan_sum += p
+            md.append(f"| {e['key']} | {ename} | {from_plan} | {total_children} | {int(plan_sum)} |")
+        
+        # Задачи без эпика
+        no_epic = [t for t in tasks if not ((t.get('jira') or {}).get('epic') or {}).get('key')]
+        if no_epic:
+            no_epic_plan = sum((t.get('plan') or {}).get('total') or 0 for t in no_epic)
+            md.append(f"| — | (эпик не привязан) | {len(no_epic)} | — | {int(no_epic_plan)} |")
+    else:
+        md.append("*Эпики не найдены.*")
+    
+    # 4. Срез по командам
+    md.append("\n## 4. Срез по командам\n")
+    md.append("| Команда (источник) | Задач из плана | План Σ (чд) | В работе | Закрыто |")
+    md.append("|---|-----|-----|-----|-----|")
+    
+    from collections import defaultdict
+    by_team = defaultdict(list)
+    for t in tasks:
+        team_obj = (t.get('jira') or {}).get('team') or {}
+        team_key = team_obj.get('value') or '—'
+        source = team_obj.get('source', '')
+        display_key = team_key
+        if source == 'assignee_fallback' and team_key != '—':
+            display_key = f"(по assignee) {team_key}"
+        by_team[display_key].append(t)
+    
+    for team_key, team_tasks in sorted(by_team.items(), key=lambda x: -len(x[1])):
+        plan_sum = sum((t.get('plan') or {}).get('total') or 0 for t in team_tasks)
+        in_progress = sum(1 for t in team_tasks 
+                            if (t.get('jira') or {}).get('status_category') 
+                            in ('analysis', 'development', 'testing'))
+        closed = sum(1 for t in team_tasks 
+                       if (t.get('jira') or {}).get('status_category') == 'finished')
+        md.append(f"| {team_key} | {len(team_tasks)} | {int(plan_sum)} | {in_progress} | {closed} |")
+    
+    # 5. Застрявшие (если timing)
+    if timing_available:
+        md.append("\n## 5. Застрявшие (⚠)\n")
+        stuck = [t for t in tasks if '⚠' in compute_marker(t, True)]
+        
+        if stuck:
+            md.append("| Ключ | Название | Эпик | Фаза | План (чд) | Факт (д) | Превышение | Статус |")
+            md.append("|------|----------|------|------|-----------|----------|------------|--------|")
+            
+            def excess(task):
+                phase = (task.get('jira') or {}).get('phase')
+                if not phase:
+                    return 0
+                pd = ((task.get('timing') or {}).get('phase_days') or {}).get(phase, 0)
+                plan_key = {'A': 'analytics', 'R': 'development', 'T': 'testing'}[phase]
+                plan = (task.get('plan') or {}).get(plan_key) or 0
+                return pd / plan if plan > 0 else pd
+            
+            stuck_sorted = sorted(stuck, key=excess, reverse=True)
+            for t in stuck_sorted:
+                cr = t['cr_key']
+                name = truncate_words(t.get('task_name'), 50)
+                epic = ((t.get('jira') or {}).get('epic') or {}).get('key') or '—'
+                phase = (t.get('jira') or {}).get('phase') or '?'
+                plan_key = {'A': 'analytics', 'R': 'development', 'T': 'testing'}.get(phase)
+                plan = (t.get('plan') or {}).get(plan_key) if plan_key else None
+                pd = ((t.get('timing') or {}).get('phase_days') or {}).get(phase, 0)
+                exc = excess(t)
+                exc_str = f"× {exc:.1f}" if exc > 0 else '—'
+                status = (t.get('jira') or {}).get('status', '—')
+                plan_str = str(int(plan)) if plan else '—'
+                md.append(f"| {cr} | {name} | {epic} | {phase} | {plan_str} | {int(pd)} | {exc_str} | {status} |")
+        else:
+            md.append("*Нет задач с превышением плана более чем в 2 раза.*")
+    
+    # 6. Не найдено
+    md.append("\n## 6. Не найдено в Jira\n")
+    not_found = [t for t in tasks 
+                   if t.get('jira') and not t['jira'].get('found')]
+    if not_found:
+        for t in not_found:
+            md.append(f"- `{t['cr_key']}` — {truncate_words(t.get('task_name'), 80)}")
+    else:
+        md.append("*Все задачи плана найдены в Jira.*")
+    
+    # 7. Без плана
+    md.append("\n## 7. Без плана\n")
+    no_plan = [t for t in tasks if not (t.get('plan') or {}).get('total')]
+    if no_plan:
+        for t in no_plan:
+            md.append(f"- `{t['cr_key']}` — {truncate_words(t.get('task_name'), 80)}")
+    else:
+        md.append("*Все задачи имеют заполненный план.*")
+    
+    md.append("\n---\n")
+    md.append("*Отчёт сгенерирован скиллом `report-builder` (pipeline pmp-vs-jira).*")
+    md.append("*Дисклеймер из секции \"Что в отчёте и чего нет\" применим ко всем числам факта.*")
+    
+    # Запись
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(md))
+    
+    # Обновить metadata
+    enriched['metadata']['report_generated_at'] = now_iso()
+    completed = enriched['metadata'].setdefault('skills_completed', [])
+    if 'report-builder' not in completed:
+        completed.append('report-builder')
+    with open(enriched_path, 'w', encoding='utf-8') as f:
+        json.dump(enriched, f, indent=2, ensure_ascii=False)
+    
+    # Сводка в stdout
+    print(json.dumps({
+        'report_path': report_path,
+        'total_tasks': len(tasks),
+        'timing_available': timing_available,
+        'sections': 7 if timing_available else 6,
+    }, ensure_ascii=False))
+
+if __name__ == '__main__':
+    cmd = sys.argv[1] if len(sys.argv) > 1 else 'build'
+    if cmd == 'build':
+        build_report()
+    else:
+        print("Usage: python3 helper.py build")
+        sys.exit(1)
 ```
 
-Сортировка — по убыванию `tasks_from_plan`.
+## 6. Steps — что делает агент в чате
 
-### Step 5. Срез по командам
+### Step 1. Валидация и запуск
 
-Группировать задачи по `task.jira.team.value`. Для каждой команды:
-- Количество задач из плана
-- План Σ (сумма)
-- В работе / Закрыто / Застряло
+Агент просто запускает helper:
 
-### Step 6. Застрявшие (опционально)
+```bash
+python3 ~/.gigacode/skills/report-builder/helper.py build
+```
 
-Только если `timing_available`. Отфильтровать задачи с маркером `⚠`, сортировать по убыванию превышения.
+helper.py:
+- Читает `pipeline/enriched.json`
+- Валидирует что есть `excel-parser` и `jira-enricher`
+- Проверяет наличие `timing-analyzer` → выбирает режим (полный/без timing)
+- Строит markdown
+- Записывает `report.md` в корне рабочей директории
+- Обновляет `metadata.report_generated_at` в enriched.json
+- Печатает JSON-сводку в stdout
 
-Превышение для фазы X = `phase_days[X] / plan[X]`.
+### Step 2. Сводка пользователю
 
-### Step 7. Не найдено и без плана
+Из stdout helper'а агент получает структуру вида:
+```json
+{"report_path": "report.md", "total_tasks": 28, "timing_available": true, "sections": 7}
+```
 
-Тривиальный отбор.
-
-### Step 8. Собрать markdown
-
-Через `helper.py` функция `build_report(...)`. Возвращает строку с полным markdown.
-
-### Step 9. Записать report.md
-
-В рабочей директории. UTF-8, без BOM, окончания строк `\n`.
-
-### Step 10. Сводка
-
-В чат:
-- Создан `report.md` (размер X KB)
-- Всего задач в отчёте: N
-- Главные секции: Сводка / Таблица / Эпики / Команды / Застрявшие / Не найдено / Без плана
+Сообщает пользователю:
+- Создан `report.md` в текущей директории
+- Задач в отчёте: 28
+- Режим: полный (с фактом А/Р/Т) или без timing
 - Совет: открыть `report.md` в редакторе с поддержкой markdown
 
-## 8. Файлы
+Если `timing_available = false` — упомянуть: "для добавления Факта А/Р/Т запустите `timing-analyzer` и пересоберите отчёт".
+
+## 7. Файлы
 
 | Файл | Назначение |
 |------|------------|
-| `.cache/enriched.json` | ЧТЕНИЕ. Не модифицируется. |
-| `report.md` | СОЗДАЁТСЯ в рабочей директории |
-| `helper.py` | Функции форматирования |
+| `pipeline/enriched.json` | ЧТЕНИЕ. Минорно обновляется (только `report_generated_at`). |
+| `report.md` | СОЗДАЁТСЯ в **корне** рабочей директории (не в `pipeline/`) |
+| `helper.py` | Один CLI с подкомандой `build` |
 
-Тот же запрет: только `helper.py`, никаких `main.py`, `process.py`, `run_*.py`.
+### Запрещённые файлы
 
-## 9. Guardrails
+Только `helper.py`. Никаких `main.py`, `process.py`, `run_*.py`, `__pycache__`.
 
-- НЕ модифицировать `.cache/enriched.json`
-- НЕ ходить в Jira
-- НЕ читать Excel
+## 8. Guardrails
+
+- Не модифицировать `pipeline/enriched.json` кроме `report_generated_at` и `skills_completed`
+- Не ходить в Jira
+- Не читать Excel
 - Если поле null — показывать `—`, не пустоту
-- Если timing-analyzer не отработал — отчёт всё равно работает (без секции 5, без колонок факта, с явной пометкой)
+- Если timing-analyzer не отработал — отчёт всё равно работает (6 секций, без Факт)
 - Никаких `<!-- HTML комментариев -->` в markdown
 - Кириллица сохраняется как есть (UTF-8, не `\u...`)
 
-## 10. Edge cases
+## 9. Edge cases
 
 | Ситуация | Поведение |
 |----------|-----------|
-| jira-enricher не отработал | Сообщить, попросить запустить, завершить |
-| timing-analyzer не отработал | Отчёт строится без колонок Факт А/Р/Т и без секции 5. Дисклеймер явный. |
-| Все 28 задач не найдены в Jira | Отчёт строится, секция "Не найдено" большая, основная таблица почти пустая по jira-данным |
-| 0 эпиков | Секция 3 пустая или "Нет эпиков" |
-| Все задачи без команды | Секция 4 содержит одну строку `—` |
-| 0 застрявших | Секция 5: "Нет застрявших задач" |
-| План А/Р/Т нулевой (0/0/0) | План Σ = 0. Маркер ⚠ ставится с осторожностью — деление на 0. helper защищает: `if plan_phase == 0 and fact_phase > 14: маркер ⚠`. |
-| Задача с timing но без явной фазы (status_category=unknown) | Маркер `❗ нестандартный`, в основной таблице "Фаза" = `?` |
-| Несколько строк дубль (как CRSIGMA-22127) | Обе строки в таблице, обе считаются |
-| Длинное имя эпика | Обрезка до 25 символов с `…` |
+| jira-enricher не отработал | helper упадёт с понятной ошибкой, агент сообщит пользователю |
+| timing-analyzer не отработал | helper строит 6 секций без Факта, в дисклеймере явная пометка |
+| Все 28 задач не найдены в Jira | Отчёт строится, секция "Не найдено" большая, основная таблица пустая по jira-данным |
+| 0 эпиков | Секция 3: "*Эпики не найдены.*" |
+| Все задачи без команды | Секция 4 содержит одну строку с `—` |
+| 0 застрявших | Секция 5: "*Нет задач с превышением.*" |
+| План А/Р/Т нулевой (0/0/0) | helper защищает: при `plan_value == 0` маркер ⚠ ставится только если факт > 14 дней |
+| Несколько строк дубль (CRSIGMA-22127) | Обе строки в таблице |
+| Длинное имя эпика | Обрезка до 25 символов через `…` (по словам) |
 
-## 11. Антипаттерны
+## 10. Антипаттерны
 
 ### Критические
 
-- Модифицировать `.cache/enriched.json` — этот скилл write-only для report.md
-- Ходить в Jira — все данные уже есть
-- Обрезка посередине слова — некрасиво, нечитаемо
-- Жёстко требовать timing-analyzer — это блокировка отчёта без причины. Должно работать без него.
-- Создавать `main.py`, `process.py`, и т.д. — только helper.py
+- **Модифицировать `pipeline/enriched.json`** кроме `report_generated_at` и `skills_completed` — это write-only скилл для report.md
+- **Ходить в Jira** — все данные уже есть
+- **Обрезка посередине слова** — некрасиво, нечитаемо
+- **Жёстко требовать timing-analyzer** — должно работать без него
+- **Создавать `main.py`, `process.py`** — только helper.py
 
 ### Обычные
 
 - Не очищать `\n` в названиях — таблица ломается
-- Выводить ID полей вместо имён (`customfield_22200` вместо `PALM.CSP.K7M`)
+- Выводить ID полей (`customfield_22200`) вместо имён (`PALM.CSP.K7M`)
 - Не сортировать таблицы
-- Длинные имена не обрезать
-- Терять кириллицу
+- Не обрезать длинные имена
+- Терять кириллицу при записи
 
-## 12. Критерий успеха
+## 11. Критерий успеха
 
 После запуска:
-1. `report.md` создан, валиден markdown
-2. Все 7 секций есть (5-я может быть пустой)
+1. `report.md` создан в корне рабочей директории, валиден markdown
+2. Все 7 секций есть (5-я может быть "*Нет застрявших.*")
 3. Дисклеймер заметен сверху
 4. Таблицы читаемы (имена обрезаны, не ломают разметку)
 5. Маркеры на местах
 6. Размер файла 10-50 KB
 
-## 13. Что отложено
+## 12. Что отложено
 
-- v3.1: HTML-версия отчёта параллельно с markdown
+- v3.2: HTML-версия отчёта параллельно с markdown
 - v4: дополнительные секции про даты ИФТ/ПСИ/ПРОМ
-- v5: Сберчат-отправка отчёта (можно интегрировать через отдельный скилл `sberchat-notifier`)
-- v6: разворот дочерних эпиков (нужно дополнить jira-enricher или новый скилл `epic-expander`)
+- v5: Сберчат-отправка отчёта (отдельный скилл `sberchat-notifier`)
+- v6: разворот дочерних эпиков

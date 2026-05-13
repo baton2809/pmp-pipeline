@@ -1,34 +1,51 @@
 # CONTRACT.md — структура данных pipeline
 
-> Все 4 скилла (`excel-parser`, `jira-enricher`, `timing-analyzer`, `report-builder`) разделяют **один файл** `.cache/enriched.json` в рабочей директории. Каждый следующий скилл читает текущее состояние, дополняет своими полями, перезаписывает обратно.
+> Все 4 скилла (`excel-parser`, `jira-enricher`, `timing-analyzer`, `report-builder`) разделяют **один файл** `pipeline/enriched.json` в рабочей директории. Каждый следующий скилл читает текущее состояние, дополняет своими полями, перезаписывает обратно.
+>
+> Дополнительно каждый скилл создаёт **видимый markdown-снимок** `pipeline/step-N-after-<skill>.md` чтобы пользователь мог сразу проверить результат каждого шага не открывая json.
 >
 > Этот документ — единственный источник истины о структуре данных. Любые изменения в `enriched.json` начинаются с обновления здесь.
 
-## Расположение файла
+## Расположение файлов
 
 ```
-<рабочая_директория>/.cache/enriched.json
+<рабочая_директория>/
+├── Бэклог и цели.xlsx              ← вход (файл Натальи)
+├── pipeline/                       ← создаётся первым скиллом, ВИДИМАЯ папка
+│   ├── enriched.json               ← канонические данные (передаются между скиллами)
+│   ├── step-1-after-excel-parser.md      ← снимок после excel-parser
+│   ├── step-2-after-jira-enricher.md     ← снимок после jira-enricher
+│   ├── step-3-after-timing-analyzer.md   ← снимок после timing-analyzer (опционально)
+└── report.md                       ← финальный отчёт от report-builder
 ```
 
-`<рабочая_директория>` — папка где лежит `Бэклог и цели.xlsx` и куда запускается GigaCode CLI. Папка `.cache/` создаётся автоматически первым скиллом (`excel-parser`).
+**Важно:** папка называется `pipeline/`, **не** `.cache/`. Точка в начале делает её скрытой в Linux/Mac — это неудобно для пользователя.
 
-## Полная структура
+## Зачем оба формата (json + md)?
+
+- **`enriched.json`** — для **скиллов**. Структурированные данные, легко парсятся, не теряют типы.
+- **`step-N-after-*.md`** — для **пользователя**. Сразу видно что наработал каждый скилл, можно проверить таблицу без открытия json.
+
+Скиллы передают данные **через json**, не через markdown. Markdown — это side-effect для прозрачности, никто его не парсит.
+
+## Полная структура enriched.json
 
 ```json
 {
   "metadata": {
     "source_file": "Бэклог и цели.xlsx",
     "sheet": "Q2_26_оценки_new_name",
-    "parsed_at": "2026-05-11T18:00:00",
+    "parsed_at": "2026-05-12T18:00:00",
     "enriched_at": null,
     "timing_at": null,
-    "scope_version": "v3.0",
+    "report_generated_at": null,
+    "scope_version": "v3.1",
     "skills_completed": ["excel-parser"]
   },
   "tasks": [
     {
       "cr_key": "CRSIGMA-26516",
-      "task_name": "Доработка УКИ. Добавление драг. металлов - золото, серебро",
+      "task_name": "Доработка УКИ. Добавление драг. металлов",
       "initiative": "Реализована ДК по повышению уровня автономности ААВ",
       "customer": "Иванов И.И.",
       "plan": {
@@ -49,21 +66,19 @@
 
 ### После `excel-parser` (обязательные поля)
 
-Заполнены только `metadata.parsed_at`, `metadata.skills_completed = ["excel-parser"]` и массив `tasks` с базовыми полями плана.
+Заполнены `metadata.parsed_at`, `metadata.skills_completed = ["excel-parser"]` и массив `tasks` с базовыми полями плана. `jira: null` и `timing: null` для каждой задачи.
 
 | Поле | Тип | Описание | Источник |
 |------|-----|----------|----------|
-| `cr_key` | string | Ключ задачи в Jira (`CRSIGMA-26516`, `ASFC-58741`) | Excel колонка B (URL или строка), парсится regex |
-| `task_name` | string | Название задачи | Excel колонка G (без `\n`, `\r`, `\t`) |
-| `initiative` | string | Инициатива (для группировки) | Excel колонка F |
-| `customer` | string \| null | Заказчик | Excel колонка C |
-| `plan.analytics` | number \| null | План аналитики (чд) | Excel колонка R (вторая версия), fallback на J |
-| `plan.development` | number \| null | План разработки (чд) | Excel колонка S, fallback на K |
-| `plan.testing` | number \| null | План тестирования (чд) | Excel колонка T, fallback на L |
+| `cr_key` | string | Ключ задачи в Jira (`CRSIGMA-26516`, `ASFC-58741`) | Excel колонка `cr` |
+| `task_name` | string | Название задачи | Excel колонка `задача` |
+| `initiative` | string | Инициатива | Excel колонка `инициатива` |
+| `customer` | string \| null | Заказчик | Excel колонка `заказчик` |
+| `plan.analytics` | number \| null | План аналитики (чд) | вторая позиция колонок `аналитика` |
+| `plan.development` | number \| null | План разработки (чд) | вторая позиция колонок `разработка` |
+| `plan.testing` | number \| null | План тестирования (чд) | вторая позиция колонок `тестирование` |
 | `plan.total` | number \| null | Сумма А+Р+Т | computed |
-| `plan.source_version` | string | `"v1"` (J/K/L) или `"v2"` (R/S/T) | вычисляется |
-
-Если задача без CR-ключа в Excel — не включается в `tasks`. Регистрируется отдельно в `metadata.skipped_rows`.
+| `plan.source_version` | string | `"v1"` (первая позиция) или `"v2"` (вторая) | вычисляется |
 
 ### После `jira-enricher`
 
@@ -73,7 +88,7 @@
 {
   "metadata": {
     ...
-    "enriched_at": "2026-05-11T18:05:00",
+    "enriched_at": "2026-05-12T18:05:00",
     "skills_completed": ["excel-parser", "jira-enricher"]
   },
   "tasks": [
@@ -84,38 +99,38 @@
         "found": true,
         "summary": "ЦКП. Доработка УКИ (металлические счета)",
         "status": "New",
-        "status_category": "not_started",
-        "phase": null,
+        "status_category": "analysis",
+        "phase": "A",
         "issue_type": "Change Request",
         "project": "CRSIGMA",
         "priority": "Critical",
         "labels": ["ПКАП.PALM", "Прайсинг", "ЦКП"],
-        "created": "2024-07-31T14:44:00+0300",
-        "updated": "2025-05-11T11:02:30+0300",
+        "created": "2026-02-13T18:24:19.841+0300",
+        "updated": "2026-05-11T11:02:30.763+0300",
         "resolutiondate": null,
         "assignee": "Гриднева Ирина Ринатовна",
         "reporter": "Никиткина Екатерина Борисовна",
         "epic": {
-          "key": "ASFC-65543",
-          "name": "ЦКП.ПГ-1 универсальная задача КИ",
-          "source": "customfield_11400"
+          "key": "ASFC-57216",
+          "name": "ЦКП.ПГ-1 универсальная задача",
+          "source": "issuelinks.Implement_in"
         },
         "team": {
           "value": "PALM.CSP.K7M",
           "source": "customfield_22200"
         },
-        "lead_time_days": 287,
-        "fetched_at": "2026-05-11T18:05:00"
+        "lead_time_days": 87,
+        "fetched_at": "2026-05-12T18:05:00"
       }
     }
   ],
   "epics": [
     {
-      "key": "ASFC-65543",
-      "name": "ЦКП.ПГ-1 универсальная задача КИ",
+      "key": "ASFC-57216",
+      "name": "ЦКП.ПГ-1 универсальная задача",
       "tasks_from_plan": ["CRSIGMA-26516", "ASFC-63820"],
       "children_count_total": 38,
-      "fetched_at": "2026-05-11T18:05:30"
+      "fetched_at": "2026-05-12T18:05:30"
     }
   ]
 }
@@ -144,6 +159,10 @@
 | `team.source` | string | `"customfield_22200"` или `"assignee_fallback"` |
 | `lead_time_days` | number | Дни от created до resolutiondate (если закрыта) или до now |
 
+**Важно про `customfield_22200`:** это **массив строк** типа `["PALM.CSP.K7M"]`, не объект. Берём первый элемент массива.
+
+**Важно про `customfield_11400`:** для **ASFC-задач** обычно содержит ключ эпика как строку. Для **CRSIGMA-задач** часто `null` — эпик находится через `issuelinks` тип `"Implement in"`.
+
 ### Маппинг статуса → category → phase
 
 Используется единый для всех скиллов:
@@ -167,7 +186,7 @@
 {
   "metadata": {
     ...
-    "timing_at": "2026-05-11T18:10:00",
+    "timing_at": "2026-05-12T18:10:00",
     "skills_completed": ["excel-parser", "jira-enricher", "timing-analyzer"]
   },
   "tasks": [
@@ -188,47 +207,113 @@
         "transitions_count": 5,
         "first_transition": "2024-08-15T09:30:00+0300",
         "last_transition": "2024-12-10T11:00:00+0300",
-        "computed_at": "2026-05-11T18:10:00"
+        "computed_at": "2026-05-12T18:10:00"
       }
     }
   ]
 }
 ```
 
-| Поле в `task.timing` | Тип | Описание |
-|----------------------|-----|----------|
-| `computed` | bool | `false` если у задачи не было changelog (например, только что создана) |
-| `phase_days.A` | number | Календарные дни в фазе А (сумма всех интервалов в статусах А) |
-| `phase_days.R` | number | Календарные дни в фазе Р |
-| `phase_days.T` | number | Календарные дни в фазе Т |
-| `phase_days.not_started` | number | Дни в not_started статусах (Backlog) |
-| `phase_days.finished` | number | Дни после перехода в финальный статус |
-| `phase_days.unknown` | number | Дни в нестандартных статусах |
-| `transitions_count` | number | Количество переходов статуса |
-| `first_transition` | string \| null | Timestamp первого перехода |
-| `last_transition` | string \| null | Timestamp последнего перехода |
-
 Если задача в `not_started` или `finished` — `timing.computed = false`, `phase_days` все нули.
 
 ### После `report-builder`
 
-Файл `enriched.json` **не изменяется**. Создаётся `report.md` в рабочей директории.
+`enriched.json` обновляется минимально (только `metadata.report_generated_at`). Создаётся `report.md` в **корне** рабочей директории (не в `pipeline/`).
 
-```json
-{
-  "metadata": {
-    ...
-    "skills_completed": ["excel-parser", "jira-enricher", "timing-analyzer", "report-builder"],
-    "report_generated_at": "2026-05-11T18:15:00"
-  }
-}
+## Структура промежуточных markdown-снимков
+
+Каждый скилл создаёт `pipeline/step-N-after-<skill>.md` после своей работы. Это **снимок текущего состояния enriched.json в человекочитаемом виде**, не финальный отчёт.
+
+### `step-1-after-excel-parser.md`
+
+```markdown
+# Снимок после excel-parser
+
+**Дата:** 2026-05-12 18:00
+**Источник:** Бэклог и цели.xlsx, лист Q2_26_оценки_new_name
+**Задач извлечено:** 28
+**Пропущено строк (без CR):** 0
+
+## Задачи плана
+
+| # | CR | Название | План А/Р/Т (Σ) | Версия плана |
+|---|-----|----------|-----------------|---------------|
+| 1 | CRSIGMA-26516 | Доработка УКИ. Добавление драг. металлов | 23/23/15 (61) | v2 |
+| 2 | CRSIGMA-23749 | Расчёт в ин. валютах по кредитам | 23/23/15 (61) | v2 |
+| ... | ... | ... | ... | ... |
+
+## Следующий шаг
+
+Запустить `jira-enricher` — добавит статусы, эпики, команды из Jira.
+```
+
+### `step-2-after-jira-enricher.md`
+
+```markdown
+# Снимок после jira-enricher
+
+**Дата:** 2026-05-12 18:05
+**Задач из плана:** 28
+**Найдено в Jira:** 28
+**Не найдено:** 0
+
+## Сводка по статусам
+
+| Категория | Количество |
+|-----------|------------|
+| not_started | 13 |
+| analysis (А) | 8 |
+| development (Р) | 5 |
+| testing (Т) | 1 |
+| finished | 1 |
+
+## Задачи
+
+| # | CR | Статус | Фаза | Эпик | Команда | Lead time |
+|---|-----|--------|------|------|---------|-----------|
+| 1 | CRSIGMA-26516 | New | А | ASFC-57216 ЦКП.ПГ-1 | PALM.CSP.K7M | 87 д |
+| ... | ... | ... | ... | ... | ... | ... |
+
+## Уникальные эпики (12)
+
+| Эпик | Имя | Задач из плана | Всего дочерних |
+|------|-----|----------------|-----------------|
+| ASFC-57216 | ЦКП.ПГ-1 универсальная задача | 2 | 38 |
+| ... | ... | ... | ... |
+
+## Следующий шаг
+
+Запустить `timing-analyzer` — добавит факт А/Р/Т для активных задач (опционально).
+Или сразу `report-builder` если timing не нужен.
+```
+
+### `step-3-after-timing-analyzer.md`
+
+```markdown
+# Снимок после timing-analyzer
+
+**Дата:** 2026-05-12 18:10
+**Активных задач:** 14
+**С реальным timing:** 12
+**Без changelog:** 2
+
+## Топ-5 задач с самыми долгими фазами
+
+| CR | Статус | Факт А (д) | Факт Р (д) | Факт Т (д) | План А/Р/Т |
+|-----|--------|------------|------------|------------|-------------|
+| ASFC-35817 | In Progress | 98 | 700 | 0 | 38/23/15 |
+| ... | ... | ... | ... | ... | ... |
+
+## Следующий шаг
+
+Запустить `report-builder` — соберёт финальный report.md.
 ```
 
 ## Валидация между скиллами
 
 Каждый скилл при запуске **проверяет**:
 
-1. Файл `.cache/enriched.json` существует (кроме `excel-parser` который его создаёт)
+1. Файл `pipeline/enriched.json` существует (кроме `excel-parser` который его создаёт)
 2. `metadata.skills_completed` содержит все предшественники:
    - `jira-enricher` требует `["excel-parser"]`
    - `timing-analyzer` требует `["excel-parser", "jira-enricher"]`
@@ -240,15 +325,55 @@
 
 ## Идемпотентность
 
-**Любой скилл можно запустить повторно.** Он перезапишет свои поля. Это полезно когда:
+**Любой скилл можно запустить повторно.** Он перезапишет свои поля и свой step-N.md. Это полезно когда:
 - Изменился Excel → перезапустить весь pipeline
 - Хочется обновить статусы Jira → перезапустить `jira-enricher`
 - Хочется пересчитать тайминги → перезапустить `timing-analyzer`
 
 Сам по себе `enriched.json` после повторного запуска перезаписывается **только в той части** которую обрабатывает данный скилл. Поля предыдущих скиллов сохраняются.
 
+## Архитектурный принцип — где живут данные
+
+**Критически важно для скиллов которые делают MCP-вызовы (`jira-enricher`, `timing-analyzer`):**
+
+```
+Агент (GigaCode CLI):
+  - Делает нативные tool calls (jira_get_issue, jira_search)
+  - Видит JSON-ответы в своём контексте
+  - Извлекает нужные поля (явно, через чтение JSON)
+  - Накапливает результаты батча в памяти контекста
+  - После каждого батча из 5 задач — вызывает helper.py через bash
+    для записи в pipeline/enriched.json
+
+Python через bash (helper.py):
+  - НЕ делает MCP-вызовов (это невозможно из Python в окружении GigaCode)
+  - Принимает данные через stdin или JSON-аргумент
+  - Парсит, валидирует, мерджит в enriched.json
+  - Записывает файл, обновляет step-N-after-*.md
+```
+
+**Запрещено** для агента:
+
+```python
+# Это НЕ работает в Python-окружении GigaCode!
+from mcp_atlassian import jira_get_issue  # такого модуля нет
+result = mcp__Atlassian__jira_get_issue(key="...")  # NameError
+```
+
+**Правильно:**
+
+```
+1. Агент в чате делает tool call: jira_get_issue(key=...)
+2. Видит JSON в контексте
+3. Извлекает поля (status.name, customfield_22200, ...)
+4. Накапливает результаты в текстовом виде
+5. После 5 задач формирует JSON-batch и вызывает:
+   echo '<batch_json>' | python3 ~/.gigacode/skills/jira-enricher/helper.py merge-batch
+6. helper.py читает stdin, мерджит в pipeline/enriched.json
+```
+
 ## Ограничения
 
-- Максимум задач в плане: ~100. При большем количестве `enriched.json` может стать большим (~500 KB), скиллы могут потерять контекст. Если планов больше — обсуждать архитектуру отдельно.
+- Максимум задач в плане: ~100. При большем количестве `enriched.json` может стать большим, скиллы могут потерять контекст.
 - Не хранится сырой ответ MCP — только извлечённые поля. Это сознательно (экономия места и контекста).
-- Не хранится changelog — только агрегированные `phase_days`. Если нужна история переходов конкретной задачи — отдельный скилл `task-details <key>` (вне scope текущего pipeline).
+- Не хранится changelog — только агрегированные `phase_days`.

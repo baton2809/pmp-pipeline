@@ -1,6 +1,14 @@
-# excel-parser — первый скилл pipeline
+# excel-parser v3.1 — первый скилл pipeline
 
-Читает `Бэклог и цели.xlsx` и создаёт `.cache/enriched.json` для последующих скиллов pipeline.
+Читает `Бэклог и цели.xlsx` и создаёт `pipeline/enriched.json` + `pipeline/step-1-after-excel-parser.md`.
+
+## Изменения v3.1 vs v3.0
+
+- ✅ Поиск колонок **по имени заголовка** (case-insensitive подстрока), не по фиксированной букве — это вернуло **28 задач** вместо 3
+- ✅ Только `openpyxl`, явный запрет на ручной XML-парсинг
+- ✅ Папка `pipeline/` (видимая) вместо `.cache/` (скрытая)
+- ✅ Дополнительно создаётся `pipeline/step-1-after-excel-parser.md` — читаемый снимок
+- ✅ Готовый код `helper.py` прямо в SPEC.md раздел 7 — снижает риск кривой реализации
 
 ## Место в pipeline
 
@@ -13,7 +21,7 @@
 
 ## Подготовка
 
-В рабочей директории должен быть `Бэклог и цели.xlsx`. MCP не нужен (этот скилл не ходит в Jira).
+В рабочей директории должен быть `Бэклог и цели.xlsx`. MCP не нужен.
 
 ## Запуск
 
@@ -28,20 +36,25 @@ gigacode
 - `skill/excel-parser/SKILL.md`
 - `skill/excel-parser/helper.py`
 
-Перед установкой проверить:
-- В `skill/excel-parser/` ровно 2 файла (SKILL.md и helper.py)
-- В SKILL.md нет заглушек `# TODO`, нет полных Python-программ
-- helper.py содержит только функции, не main()-блока с прогонкой
+### Шаг 2. Проверить перед установкой
 
-### Шаг 2. Установить
+В `skill/excel-parser/` должно быть **ровно 2 файла**:
+- В SKILL.md нет заглушек `# TODO`, нет полных Python-программ
+- helper.py использует `openpyxl.load_workbook` (не парсит XML вручную)
+- `find_header_row` ищет 'cr' в строках 1-5
+- `detect_columns` ищет по подстроке (`'cr'`, `'задача'`, `'аналитика'` и т.д.)
+- `parse_cr_key` использует `re.search`, **не** `re.match`/`re.fullmatch`
+- Нет других `.py` файлов кроме `helper.py`
+
+### Шаг 3. Установить
 
 ```bash
 cp -r skill/excel-parser ~/.gigacode/skills/
 ```
 
-### Шаг 3. Запустить
+### Шаг 4. Запустить
 
-В рабочей директории (где лежит `Бэклог и цели.xlsx`):
+В рабочей директории (где `Бэклог и цели.xlsx`):
 
 ```bash
 gigacode
@@ -49,20 +62,31 @@ gigacode
 
 В чате: "запусти excel-parser".
 
-После прогона будет `.cache/enriched.json` с распарсенным планом.
-
 ## Проверка результата
 
+После прогона будет два файла в `pipeline/`:
+- `enriched.json` — данные для следующих скиллов
+- `step-1-after-excel-parser.md` — читаемый снимок
+
 ```bash
-cat .cache/enriched.json | python3 -m json.tool | head -50
+ls -la pipeline/
+cat pipeline/step-1-after-excel-parser.md | head -20
 ```
 
-Должны быть:
-- `metadata.skills_completed = ["excel-parser"]`
-- `tasks` массив с 28 задачами (примерно)
-- У каждой задачи заполнено `cr_key`, `task_name`, `plan.analytics/development/testing`
-- `jira: null`, `timing: null` (для следующих скиллов)
+Также можно проверить через Python:
+
+```bash
+python3 -c "
+import json
+d = json.load(open('pipeline/enriched.json'))
+print('Skills:', d['metadata']['skills_completed'])
+print('Tasks:', len(d['tasks']))
+print('First task:', d['tasks'][0]['cr_key'])
+"
+```
+
+Должно быть `Tasks: 28`.
 
 ## Следующий шаг
 
-Запустить `jira-enricher` — он добавит данные из Jira в тот же `enriched.json`.
+Запустить `jira-enricher` — добавит данные из Jira в тот же `enriched.json`.

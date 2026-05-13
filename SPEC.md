@@ -1,6 +1,6 @@
 # SPEC: excel-parser
 
-> Первый скилл pipeline pmp-vs-jira. Читает `Бэклог и цели.xlsx`, лист `Q2_26_оценки_new_name`, извлекает план задач квартала и сохраняет в `.cache/enriched.json`.
+> Первый скилл pipeline pmp-vs-jira. Читает `Бэклог и цели.xlsx`, лист `Q2_26_оценки_new_name`, извлекает план задач квартала и сохраняет в `pipeline/enriched.json`.
 >
 > Никаких вызовов MCP. Только Excel. Это база для следующих скиллов pipeline.
 
@@ -13,7 +13,7 @@
    excel-parser ◄── (этот скилл)
         │
         ▼
-   .cache/enriched.json
+   pipeline/enriched.json
         │
         ▼
    jira-enricher → timing-analyzer → report-builder
@@ -25,7 +25,7 @@
 - Найти жёстко зафиксированный лист `Q2_26_оценки_new_name`
 - Извлечь 28 задач квартала с CR-ключами, названиями, инициативами, планом А/Р/Т
 - Создать структуру `enriched.json` согласно CONTRACT.md, секция "После excel-parser"
-- Сохранить в `.cache/enriched.json` рабочей директории
+- Сохранить в `pipeline/enriched.json` рабочей директории
 
 ## 3. Анти-цели
 
@@ -45,9 +45,9 @@
 
 ### Выход
 
-`.cache/enriched.json` в текущей рабочей директории. Структура — см. CONTRACT.md секция "После excel-parser".
+`pipeline/enriched.json` в текущей рабочей директории. Структура — см. CONTRACT.md секция "После excel-parser".
 
-Папку `.cache/` создать если не существует.
+Папку `pipeline/` создать если не существует.
 
 ## 5. Структура Excel — поиск колонок по имени заголовка
 
@@ -193,9 +193,9 @@
    ```
 8. Добавить в `tasks` массив
 
-### Step 6. Сохранить json
+### Step 6. Сохранить json и markdown-снимок
 
-1. Создать папку `.cache/` если её нет (`os.makedirs('.cache', exist_ok=True)`)
+1. Создать папку `pipeline/` если её нет (`os.makedirs('pipeline', exist_ok=True)`)
 2. Сформировать полную структуру согласно CONTRACT.md секция "После excel-parser":
    ```python
    enriched = {
@@ -205,7 +205,8 @@
        "parsed_at": "<now ISO 8601>",
        "enriched_at": None,
        "timing_at": None,
-       "scope_version": "v3.0",
+       "report_generated_at": None,
+       "scope_version": "v3.1",
        "skills_completed": ["excel-parser"],
        "skipped_rows": [...],
        "tasks_count": len(tasks)
@@ -214,11 +215,20 @@
      "epics": []
    }
    ```
-3. Записать в `.cache/enriched.json`:
+3. Записать в `pipeline/enriched.json`:
    ```python
-   with open('.cache/enriched.json', 'w', encoding='utf-8') as f:
+   with open('pipeline/enriched.json', 'w', encoding='utf-8') as f:
      json.dump(enriched, f, indent=2, ensure_ascii=False)
    ```
+4. **Создать markdown-снимок** `pipeline/step-1-after-excel-parser.md` — это **видимый** артефакт для пользователя, чтобы он мог сразу проверить результат не открывая json.
+
+   Структура (см. CONTRACT.md секция "step-1-after-excel-parser.md"):
+   - Заголовок: `# Снимок после excel-parser`
+   - Дата, источник, число задач
+   - Таблица всех задач: `#`, `CR`, `Название` (обрезано до 50 символов), `План А/Р/Т (Σ)`, `Версия плана`
+   - Подсказка "Следующий шаг: запустите `jira-enricher`"
+   
+   Реализация — `helper.write_step1_markdown(enriched)`.
 
 ### Step 7. Сообщить пользователю
 
@@ -229,14 +239,16 @@
 - Распознано колонок: `cr` (K позиций), `task`, `initiative`, `аналитика` (2 позиции), и т.д.
 - **Извлечено задач: N** ← главное число, должно быть **28** для текущего файла Натальи
 - Пропущено строк (без CR): M
-- Создан файл: `.cache/enriched.json`
+- Созданы файлы:
+  - `pipeline/enriched.json` (данные для следующих скиллов)
+  - `pipeline/step-1-after-excel-parser.md` (читаемый снимок)
 - Следующий шаг: запустите `jira-enricher`
 
 ## 7. Файлы которые скилл может создавать
 
 | Файл | Назначение |
 |------|------------|
-| `.cache/enriched.json` | Основной выход, согласно CONTRACT.md |
+| `pipeline/enriched.json` | Основной выход, согласно CONTRACT.md |
 | `helper.py` (рядом со SKILL.md в `~/.gigacode/skills/excel-parser/`) | Вспомогательные функции |
 
 ### Минимальный набор функций которые должны быть в `helper.py`
@@ -353,11 +365,45 @@ def extract_plan(row_idx: int, worksheet, columns: dict[str, list[int]]) -> dict
         'source_version': source_version,
     }
 
-def save_enriched(data: dict, path: str = '.cache/enriched.json'):
-    """Сохранить JSON в файл, создавая .cache/ если её нет."""
+def save_enriched(data: dict, path: str = 'pipeline/enriched.json'):
+    """Сохранить JSON в файл, создавая pipeline/ если её нет."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+def write_step1_markdown(enriched: dict, path: str = 'pipeline/step-1-after-excel-parser.md'):
+    """Сохранить читаемый markdown-снимок после excel-parser."""
+    md = []
+    md.append("# Снимок после excel-parser\n")
+    md.append(f"**Дата:** {enriched['metadata']['parsed_at']}\n")
+    md.append(f"**Источник:** {enriched['metadata']['source_file']}, лист {enriched['metadata']['sheet']}\n")
+    md.append(f"**Задач извлечено:** {len(enriched['tasks'])}\n")
+    skipped = len(enriched['metadata'].get('skipped_rows', []))
+    md.append(f"**Пропущено строк (без CR):** {skipped}\n")
+    md.append("\n## Задачи плана\n")
+    md.append("| # | CR | Название | План А/Р/Т (Σ) | Версия плана |")
+    md.append("|---|-----|----------|-----------------|---------------|")
+    for i, task in enumerate(enriched['tasks'], 1):
+        name = (task.get('task_name') or '')[:50]
+        if len(task.get('task_name') or '') > 50:
+            name = name.rsplit(' ', 1)[0] + '…'
+        p = task.get('plan') or {}
+        a = p.get('analytics')
+        r = p.get('development')
+        t = p.get('testing')
+        total = p.get('total')
+        if total is None:
+            plan_str = '—'
+        else:
+            def fmt(v):
+                return str(int(v)) if v is not None else '0'
+            plan_str = f"{fmt(a)}/{fmt(r)}/{fmt(t)} ({int(total)})"
+        sv = p.get('source_version', 'none')
+        md.append(f"| {i} | {task['cr_key']} | {name} | {plan_str} | {sv} |")
+    md.append("\n## Следующий шаг\n")
+    md.append("Запустить `jira-enricher` — добавит статусы, эпики, команды из Jira.")
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(md))
 
 def now_iso() -> str:
     """Текущее время в ISO 8601 с offset."""
@@ -439,7 +485,7 @@ SKILL.md — это **инструкция для агента**, а не Python
 
 - Записывать в `enriched.json` сырой ответ openpyxl без очистки текста (`\n`, `\r`)
 - Падать на одной плохой строке вместо `skipped_rows`
-- Не создавать `.cache/` если её нет (нужно `os.makedirs(..., exist_ok=True)`)
+- Не создавать `pipeline/` если её нет (нужно `os.makedirs(..., exist_ok=True)`)
 - Использовать `re.match` или `re.fullmatch` для CR-ключа — нужен `re.search` (потому что ключ может быть в URL, не в начале строки)
 - Сохранять JSON без `ensure_ascii=False` — кириллица превратится в `\u...`
 - Считать source_version как "v2" если только R/S/T пусты — нужно проверять что **хотя бы одна v2-позиция была не пуста**
@@ -447,7 +493,7 @@ SKILL.md — это **инструкция для агента**, а не Python
 ## 12. Критерий успеха
 
 После запуска:
-1. Файл `.cache/enriched.json` создан и валиден (структура совпадает с CONTRACT.md)
+1. Файл `pipeline/enriched.json` создан и валиден (структура совпадает с CONTRACT.md)
 2. Количество задач в массиве `tasks` соответствует количеству CR-ключей в Excel
 3. У каждой задачи заполнены `cr_key`, `task_name`, `initiative`, `plan`
 4. `metadata.skills_completed = ["excel-parser"]`
