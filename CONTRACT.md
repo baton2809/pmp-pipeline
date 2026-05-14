@@ -155,11 +155,11 @@
 | `epic.key` | string \| null | Ключ эпика |
 | `epic.name` | string \| null | Имя эпика |
 | `epic.source` | string \| null | `"customfield_11400"` или `"issuelinks.Implement_in"` |
-| `team.value` | string \| null | Команда (например `PALM.CSP.K7M`) |
+| `team.value` | string \| null | Поток разработки (например `PALM.CSP.K7M` — техническая метка из customfield_22200, не "команда" типа "Пальмира") |
 | `team.source` | string | `"customfield_22200"` или `"assignee_fallback"` |
 | `lead_time_days` | number | Дни от created до resolutiondate (если закрыта) или до now |
 
-**Важно про `customfield_22200`:** это **массив строк** типа `["PALM.CSP.K7M"]`, не объект. Берём первый элемент массива.
+**Важно про `customfield_22200`:** это **массив строк** типа `["PALM.CSP.K7M"]`, не объект. Берём первый элемент массива. Это **техническая метка потока разработки** в Сбер-Jira (`PALM.*` означает Palmira-стек), а не "команда" в обычном понимании. Поэтому в отчёте колонку называем "Поток/Проект", не "Команда".
 
 **Важно про `customfield_11400`:** для **ASFC-задач** обычно содержит ключ эпика как строку. Для **CRSIGMA-задач** часто `null` — эпик находится через `issuelinks` тип `"Implement in"`.
 
@@ -216,6 +216,45 @@
 
 Если задача в `not_started` или `finished` — `timing.computed = false`, `phase_days` все нули.
 
+### Структура ответа MCP с changelog (для timing-analyzer)
+
+Важно для скилла `timing-analyzer` который запрашивает changelog. Реальная структура ответа Сбер-MCP:
+
+```python
+{
+    'key': 'ASFC-67203',
+    'fields': {
+        'created': '2026-04-23T12:40:49+0300',
+        'status': {'name': 'Ready for QA'},
+        'resolutiondate': None,
+    },
+    'changelogs': [                           # ← МНОЖЕСТВЕННОЕ число!
+        {
+            'created': '2025-08-14T13:32:23.287+0300',
+            'items': [
+                {
+                    'field': 'status',
+                    'fromString': 'New',      # ← camelCase для status!
+                    'toString': 'In Progress',
+                },
+                {
+                    'field': 'Link',
+                    'to_string': '...',       # ← snake_case для не-status
+                }
+            ]
+        }
+    ]
+}
+```
+
+**Что критично:**
+1. Ключ верхнего уровня — **`changelogs`** (множественное число). НЕ `changelog`.
+2. **Нет** обёртки `histories` — массив сразу содержит элементы.
+3. Для `field == 'status'` — поля **`fromString`** / **`toString`** (camelCase).
+4. Для других полей (`Link`, `description`, ...) — могут быть другие имена. Эти переходы фильтруем.
+
+Скилл `timing-analyzer` использует функцию `extract_status_transitions(changelog_list)` которая фильтрует только status-переходы.
+
 ### После `report-builder`
 
 `enriched.json` обновляется минимально (только `metadata.report_generated_at`). Создаётся `report.md` в **корне** рабочей директории (не в `pipeline/`).
@@ -269,7 +308,7 @@
 
 ## Задачи
 
-| # | CR | Статус | Фаза | Эпик | Команда | Lead time |
+| # | CR | Статус | Фаза | Эпик | Поток/Проект | Lead time |
 |---|-----|--------|------|------|---------|-----------|
 | 1 | CRSIGMA-26516 | New | А | ASFC-57216 ЦКП.ПГ-1 | PALM.CSP.K7M | 87 д |
 | ... | ... | ... | ... | ... | ... | ... |
@@ -341,13 +380,11 @@
   - Делает нативные tool calls (jira_get_issue, jira_search)
   - Видит JSON-ответы в своём контексте
   - Извлекает нужные поля (явно, через чтение JSON)
-  - Накапливает результаты батча в памяти контекста
-  - После каждого батча из 5 задач — вызывает helper.py через bash
-    для записи в pipeline/enriched.json
+  - Передаёт данные в helper.py через bash
 
 Python через bash (helper.py):
   - НЕ делает MCP-вызовов (это невозможно из Python в окружении GigaCode)
-  - Принимает данные через stdin или JSON-аргумент
+  - Принимает данные через stdin (для маленьких batch) или читает из файла на диске (для больших)
   - Парсит, валидирует, мерджит в enriched.json
   - Записывает файл, обновляет step-N-after-*.md
 ```
@@ -360,17 +397,45 @@ from mcp_atlassian import jira_get_issue  # такого модуля нет
 result = mcp__Atlassian__jira_get_issue(key="...")  # NameError
 ```
 
-**Правильно:**
+### Два паттерна передачи данных агент → Python
+
+**Паттерн A: stdin через echo (для маленьких ответов).**
+
+Подходит для `jira-enricher` где каждый ответ компактный (без changelog ~2-3 KB), но **батчами по 5 задач** ответы помещаются в командной строке через `echo`:
 
 ```
-1. Агент в чате делает tool call: jira_get_issue(key=...)
+1. Агент делает 5 tool calls: jira_get_issue(key=...)
 2. Видит JSON в контексте
-3. Извлекает поля (status.name, customfield_22200, ...)
-4. Накапливает результаты в текстовом виде
-5. После 5 задач формирует JSON-batch и вызывает:
+3. Извлекает поля из каждого ответа, накапливает batch
+4. После 5 задач:
    echo '<batch_json>' | python3 ~/.gigacode/skills/jira-enricher/helper.py merge-batch
-6. helper.py читает stdin, мерджит в pipeline/enriched.json
+5. helper.py читает stdin, мерджит в pipeline/enriched.json
 ```
+
+**Паттерн B: WriteFile + чтение из файла (для больших ответов).**
+
+Обязателен для `timing-analyzer` где каждый ответ с `expand=changelog` весит 5-10 KB. Передача через `echo` ломается на длине команды и кавычках. Архитектура streaming:
+
+```
+Для каждой active задачи (по ОДНОЙ, не batch):
+  1. Tool call: jira_get_issue(key=..., expand="changelog")
+     → агент получает большой JSON в контекст
+  2. Tool: WriteFile (встроенный в GigaCode CLI)
+     path = "pipeline/tmp/<cr_key>.json"
+     content = <сырой JSON-ответ>
+     → JSON на диске
+  3. Shell: python3 helper.py compute-from-file pipeline/tmp/<cr_key>.json
+     → helper читает с диска, считает, мерджит, выводит сводку
+  4. После этого JSON-ответ "выпадает" из контекста — он уже обработан
+  5. Следующая задача начинается с пустого контекста по JSON-ответам
+```
+
+**Запрещено для Паттерна B:**
+- `echo '...' > file.json` через bash — длина команды и кавычки ломают большой JSON
+- `python3 -c "..."` с JSON в коде — то же
+- Запись в `~/.gigacode/tmp/` или любые пути содержащие `.gigacode/` — Filesystem Guard блокирует
+
+Только **WriteFile tool агента + рабочая директория проекта** (`pipeline/tmp/`).
 
 ## Ограничения
 

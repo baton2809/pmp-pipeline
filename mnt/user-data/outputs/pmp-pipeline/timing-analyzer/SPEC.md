@@ -1,8 +1,12 @@
-# SPEC: timing-analyzer (v3.1)
+# SPEC: timing-analyzer (v3.2)
 
-> Третий скилл pipeline. Читает `pipeline/enriched.json` после `jira-enricher`. Для **активных** задач (статус не not_started и не finished) делает второй `jira_get_issue` с `expand=changelog`, парсит историю переходов статусов, считает календарные дни в каждой фазе А/Р/Т.
+> Третий скилл pipeline. Читает `pipeline/enriched.json` после `jira-enricher`. Для **активных** задач делает второй `jira_get_issue` с `expand=changelog`, парсит историю переходов статусов, считает календарные дни в каждой фазе А/Р/Т.
 >
-> **Архитектурное правило (то же что в `jira-enricher`):** агент делает нативные tool calls в чате, накапливает результаты, передаёт батчи в `helper.py` через bash + stdin. Python никогда не вызывает MCP.
+> **Главные изменения v3.2 vs v3.1:**
+> 1. Структура changelog в ответе MCP — `changelogs` (множественное число), без обёртки `histories`
+> 2. Поля переходов — `fromString`/`toString` (camelCase) только для `field == 'status'`
+> 3. Архитектура передачи: **WriteFile tool агента** в рабочую директорию, **не** stdin/echo. Filesystem Guard блокирует `.gigacode/tmp/`.
+> 4. Streaming: после **каждой** задачи записываем JSON в файл и сразу вызываем helper. НЕ копим в контексте.
 
 ---
 
@@ -18,26 +22,25 @@
 ## 2. Цели
 
 - Прочитать `pipeline/enriched.json`, валидировать что `jira-enricher` отработал
-- Отфильтровать **активные** задачи: `task.jira.status_category in ["analysis", "development", "testing"]` и `task.jira.found = true`
-- Для каждой такой задачи сделать `jira_get_issue` с `expand=changelog`
-- Извлечь историю переходов статусов
-- Построить timeline с timestamps
-- Применить mapping статус→фаза, сгруппировать интервалы по фазам
-- Посчитать `phase_days = {A, R, T, not_started, finished, unknown}`
-- Записать `task.timing` для каждой обработанной задачи
-- Для не-активных задач — `timing.computed = false`, `phase_days` нули
-- Перезаписать `pipeline/enriched.json`
+- Получить список **активных** задач: `task.jira.status_category in ["analysis", "development", "testing"]` и `task.jira.found = true`
+- Для каждой активной задачи (по одной):
+  1. Tool call `jira_get_issue(key, expand="changelog")`
+  2. Сразу **WriteFile** ответа в `pipeline/tmp/<cr_key>.json` в рабочей директории
+  3. Вызвать `python3 helper.py compute-from-file pipeline/tmp/<cr_key>.json`
+  4. helper.py парсит файл, считает timing, мерджит в enriched.json
+- Для не-активных задач — заполнить тривиальный timing через `fill-inactive`
 - Создать `pipeline/step-3-after-timing-analyzer.md`
+- Очистить `pipeline/tmp/` (опционально)
 
 ## 3. Анти-цели
 
-- **НЕ** обрабатывать not_started задачи (нет интересной истории)
-- **НЕ** обрабатывать finished задачи (для v3 — отложено в v3.2)
-- **НЕ** хранить сырой changelog в `enriched.json` — только агрегированные `phase_days`
-- **НЕ** генерировать финальный markdown — только step-3 snapshot
-- **НЕ** делать `jira_search` — это работа jira-enricher
+- **НЕ** запрашивать changelog для not_started / finished задач
+- **НЕ** хранить JSON-ответы MCP в контексте агента — переполняется при 24 задачах
+- **НЕ** пытаться передать changelog через stdin/echo — слишком большой
+- **НЕ** записывать в `~/.gigacode/tmp/` — Filesystem Guard блокирует
+- **НЕ** создавать `main.py`, `process_timing.py`, `run_timing.sh`, `batch_timing.json` или любые другие файлы кроме `helper.py`, `enriched.json`, `step-3.md`, `pipeline/tmp/<key>.json`
 
-## 4. Формула вызова MCP — зафиксирована
+## 4. Формула вызова MCP
 
 ### Для каждой активной задачи (нативный tool call агента)
 
@@ -51,10 +54,94 @@ Tool: jira_get_issue
 ```
 
 - `expand=changelog` ОБЯЗАТЕЛЕН
-- `fields` минимальный — нам нужны только базовые поля (timestamp создания, имя статуса, дата закрытия)
-- Это нативный tool call агента в чате, **не Python-функция**
+- `fields` — минимальный (5 полей)
+- Это нативный tool call агента
 
-## 5. Готовый код helper.py — используйте как основу
+## 5. Структура ответа MCP — зафиксированная
+
+**Подтверждено на реальных вызовах** в GigaCode CLI к Сбер-MCP:
+
+```python
+{
+    'key': 'ASFC-67203',
+    'fields': {
+        'summary': '...',
+        'status': {'name': 'Ready for QA'},
+        'created': '2026-04-23T12:40:49+0300',
+        'updated': '...',
+        'resolutiondate': None,
+    },
+    'changelogs': [                              # ← МНОЖЕСТВЕННОЕ ЧИСЛО
+        {
+            'created': '2025-08-14T13:32:23.287+0300',
+            'items': [
+                {
+                    'field': 'status',
+                    'fromString': 'New',         # ← camelCase для status
+                    'toString': 'In Progress',
+                },
+                {
+                    'field': 'Link',
+                    'to_string': '...',          # ← другие поля могут быть snake_case
+                },
+            ]
+        },
+    ]
+}
+```
+
+**Важно про структуру:**
+1. Ключ верхнего уровня — **`changelogs`** (множественное число). НЕ `changelog`.
+2. **Нет** промежуточной обёртки `histories` — массив сразу содержит элементы.
+3. Для `item.field == 'status'` — поля **`fromString`** и **`toString`** (camelCase)
+4. Для других значений `field` (`Link`, и т.д.) — могут быть другие имена полей. Эти переходы нам **не нужны** — фильтруем только `field == 'status'`.
+
+### Граничный случай
+
+Если у задачи **нет переходов статуса** — `changelogs` пустой или содержит только non-status элементы. Тогда `timing.computed = false` с причиной `no_status_transitions`.
+
+## 6. Архитектура передачи данных — критическая часть
+
+### Главное правило
+
+Контекст агента переполняется при 24 задачах с changelog (каждый ответ 600-800 строк JSON). Поэтому:
+
+```
+ПЛОХО (переполнит контекст):
+  1. 24 tool calls подряд
+  2. Копим JSON-ответы в контексте агента
+  3. В конце вызываем helper
+
+ХОРОШО (streaming, обрабатываем по одной):
+  Для каждой active задачи:
+    1. Tool call jira_get_issue (получаем JSON в контекст)
+    2. WriteFile JSON в pipeline/tmp/<cr_key>.json
+    3. Shell: python3 helper.py compute-from-file pipeline/tmp/<cr_key>.json
+    4. helper.py прочитал, посчитал, записал в enriched.json
+    5. JSON-ответ выпадает из контекста — он уже на диске
+  Следующая задача начинается с пустого контекста по JSON
+```
+
+### Tool который записывает на диск
+
+GigaCode CLI имеет встроенный **WriteFile tool** (это не bash и не python). Использовать **только его** для записи JSON-ответов MCP.
+
+```
+Tool: WriteFile
+path = "pipeline/tmp/CRSIGMA-26516.json"
+content = <сырой JSON-ответ от jira_get_issue>
+```
+
+### Что запрещено
+
+- **`echo '...' > file.json` через bash** — длина команды и кавычки ломают большие JSON
+- **`python3 -c "..."` с JSON в коде** — то же
+- **Запись в `~/.gigacode/tmp/`** — Filesystem Guard блокирует (`Filesystem Guard denied`)
+- **Любые пути содержащие `.gigacode/`** — заблокировано
+
+Только **рабочая директория проекта** через **WriteFile tool агента**.
+
+## 7. Готовый код helper.py — используйте как основу
 
 ```python
 # helper.py для timing-analyzer
@@ -63,8 +150,8 @@ import json
 import sys
 import re
 import os
+import glob
 from datetime import datetime, timezone
-from collections import OrderedDict
 
 # === Mapping (то же что в jira-enricher) ===
 
@@ -102,12 +189,11 @@ def map_status(status_name):
         return ('unknown', None)
     return STATUS_MAP.get(str(status_name).strip().lower(), ('unknown', None))
 
-# === Парсинг timestamps ===
-
 def parse_iso(s):
     """Парсит ISO 8601 с offset (например '2026-02-13T18:24:19.841+0300')."""
     if not s:
         return None
+    s = str(s)
     if re.search(r'[+-]\d{4}$', s):
         s = s[:-2] + ':' + s[-2:]
     try:
@@ -117,27 +203,33 @@ def parse_iso(s):
 
 # === Алгоритм расчёта phase_days ===
 
-def extract_status_transitions(changelog):
-    """Извлечь переходы статусов из changelog. Возвращает отсортированный список."""
+def extract_status_transitions(changelog_list):
+    """Извлечь переходы статусов из ответа MCP.
+    
+    changelog_list — значение поля 'changelogs' из ответа (МНОЖЕСТВЕННОЕ число).
+    Плоский список без обёртки 'histories'.
+    
+    Возвращает отсортированный по timestamp список переходов статуса.
+    Фильтрует ТОЛЬКО элементы с field == 'status'.
+    """
     transitions = []
-    for history in (changelog or {}).get('histories', []) or []:
-        created = parse_iso(history.get('created'))
+    for entry in (changelog_list or []):
+        created = parse_iso(entry.get('created'))
         if not created:
             continue
-        for item in history.get('items', []) or []:
-            if item.get('field') == 'status':
-                transitions.append({
-                    'created': created,
-                    'from_string': item.get('fromString'),
-                    'to_string': item.get('toString'),
-                })
+        for item in entry.get('items', []) or []:
+            if item.get('field') != 'status':
+                continue
+            # Для статуса MCP возвращает camelCase: fromString, toString
+            transitions.append({
+                'created': created,
+                'from_string': item.get('fromString'),
+                'to_string': item.get('toString'),
+            })
     return sorted(transitions, key=lambda t: t['created'])
 
 def build_timeline(transitions, task_created_str, task_resolutiondate_str, now_dt=None):
-    """Построить timeline статусов с интервалами.
-    
-    Возвращает список dict вида {status, from, to}.
-    Если переходов нет — возвращает пустой список (timing не считаем)."""
+    """Построить timeline статусов с интервалами."""
     if not transitions:
         return []
 
@@ -183,7 +275,7 @@ def build_timeline(transitions, task_created_str, task_resolutiondate_str, now_d
     return timeline
 
 def aggregate_phase_days(timeline):
-    """Сгруппировать интервалы timeline по фазам, вернуть phase_days."""
+    """Сгруппировать интервалы timeline по фазам."""
     phase_days = {'A': 0.0, 'R': 0.0, 'T': 0.0,
                   'not_started': 0.0, 'finished': 0.0, 'unknown': 0.0}
 
@@ -191,7 +283,7 @@ def aggregate_phase_days(timeline):
         category, phase = map_status(interval['status'])
         days = (interval['to'] - interval['from']).total_seconds() / 86400.0
         if days < 0:
-            continue  # на всякий случай
+            continue
         if phase in ('A', 'R', 'T'):
             phase_days[phase] += days
         elif category in ('not_started', 'finished', 'unknown'):
@@ -201,55 +293,8 @@ def aggregate_phase_days(timeline):
 
     return {k: round(v, 1) for k, v in phase_days.items()}
 
-def compute_timing(jira_response, task_created, task_resolutiondate):
-    """Главная функция — принимает ответ jira_get_issue с expand=changelog,
-    возвращает структуру для task.timing."""
-    if not jira_response:
-        return {
-            'computed': False,
-            'phase_days': {'A': 0, 'R': 0, 'T': 0, 'not_started': 0, 'finished': 0, 'unknown': 0},
-            'transitions_count': 0,
-            'first_transition': None,
-            'last_transition': None,
-            'reason': 'no_response',
-        }
-
-    changelog = jira_response.get('changelog')
-    if not changelog:
-        return {
-            'computed': False,
-            'phase_days': {'A': 0, 'R': 0, 'T': 0, 'not_started': 0, 'finished': 0, 'unknown': 0},
-            'transitions_count': 0,
-            'first_transition': None,
-            'last_transition': None,
-            'reason': 'no_changelog',
-        }
-
-    transitions = extract_status_transitions(changelog)
-    if not transitions:
-        return {
-            'computed': False,
-            'phase_days': {'A': 0, 'R': 0, 'T': 0, 'not_started': 0, 'finished': 0, 'unknown': 0},
-            'transitions_count': 0,
-            'first_transition': None,
-            'last_transition': None,
-            'reason': 'no_status_transitions',
-        }
-
-    timeline = build_timeline(transitions, task_created, task_resolutiondate)
-    phase_days = aggregate_phase_days(timeline)
-
-    return {
-        'computed': True,
-        'phase_days': phase_days,
-        'transitions_count': len(transitions),
-        'first_transition': transitions[0]['created'].isoformat() if transitions else None,
-        'last_transition': transitions[-1]['created'].isoformat() if transitions else None,
-        'computed_at': now_iso(),
-    }
-
-def trivial_timing(reason='not_active'):
-    """Заглушка для неактивных задач."""
+def _trivial(reason='not_active'):
+    """Тривиальный timing — все нули."""
     return {
         'computed': False,
         'phase_days': {'A': 0, 'R': 0, 'T': 0, 'not_started': 0, 'finished': 0, 'unknown': 0},
@@ -259,8 +304,38 @@ def trivial_timing(reason='not_active'):
         'reason': reason,
     }
 
+def compute_timing(jira_response, task_created, task_resolutiondate):
+    """Принимает ПОЛНЫЙ ответ jira_get_issue с expand=changelog."""
+    if not jira_response:
+        return _trivial('no_response')
+
+    # КРИТИЧНО: ключ 'changelogs' (множественное число)
+    changelog_list = jira_response.get('changelogs')
+    if not changelog_list:
+        return _trivial('no_changelog')
+
+    transitions = extract_status_transitions(changelog_list)
+    if not transitions:
+        # changelog есть, но переходов status нет
+        return _trivial('no_status_transitions')
+
+    timeline = build_timeline(transitions, task_created, task_resolutiondate)
+    if not timeline:
+        return _trivial('empty_timeline')
+
+    phase_days = aggregate_phase_days(timeline)
+
+    return {
+        'computed': True,
+        'phase_days': phase_days,
+        'transitions_count': len(transitions),
+        'first_transition': transitions[0]['created'].isoformat(),
+        'last_transition': transitions[-1]['created'].isoformat(),
+        'computed_at': now_iso(),
+    }
+
 def is_active(task):
-    """Активна ли задача? (Нужно ли считать timing через changelog)"""
+    """Активна ли задача? (Нужен ли changelog)"""
     jira = task.get('jira')
     if not jira or not jira.get('found'):
         return False
@@ -272,133 +347,111 @@ def now_iso():
 # === CLI entry-points ===
 
 def list_active(enriched_path='pipeline/enriched.json'):
-    """Вывести в stdout список cr_key активных задач (тех для кого нужен changelog).
-    Используется так:
-        python3 helper.py list-active
-    Возвращает JSON-массив на stdout."""
+    """Вывести JSON-массив cr_key активных задач."""
     with open(enriched_path, 'r', encoding='utf-8') as f:
         enriched = json.load(f)
     active = [t['cr_key'] for t in enriched['tasks'] if is_active(t)]
     print(json.dumps(active, ensure_ascii=False))
 
 def fill_inactive(enriched_path='pipeline/enriched.json'):
-    """Заполнить task.timing для всех НЕ активных задач (тривиальное значение)."""
+    """Заполнить task.timing для всех НЕ активных задач."""
     with open(enriched_path, 'r', encoding='utf-8') as f:
         enriched = json.load(f)
-    
+
     filled = 0
     for task in enriched['tasks']:
         if not is_active(task):
             jira = task.get('jira') or {}
-            if not jira.get('found'):
-                reason = 'not_found'
-            else:
-                reason = 'not_active'
-            task['timing'] = trivial_timing(reason=reason)
+            reason = 'not_found' if not jira.get('found') else 'not_active'
+            task['timing'] = _trivial(reason=reason)
             filled += 1
-    
+
     with open(enriched_path, 'w', encoding='utf-8') as f:
         json.dump(enriched, f, indent=2, ensure_ascii=False)
-    
+
     print(f"Filled trivial timing for {filled} non-active tasks")
 
-def merge_timing_batch(enriched_path='pipeline/enriched.json'):
-    """Принять batch результатов timing через stdin, мерджить в enriched.json.
+def compute_from_file(file_path, enriched_path='pipeline/enriched.json'):
+    """Прочитать сырой ответ MCP из файла, посчитать timing, мерджить.
     
-    Формат входа:
-    [
-      {
-        "cr_key": "CRSIGMA-23749",
-        "timing": {...результат compute_timing...}
-      },
-      ...
-    ]
+    ОСНОВНОЙ ENTRY POINT.
     
     Использование:
-        echo '<batch>' | python3 helper.py merge-batch
+        python3 helper.py compute-from-file pipeline/tmp/CRSIGMA-26516.json
+    
+    Файл должен содержать полный JSON-ответ jira_get_issue с expand=changelog,
+    записанный агентом через WriteFile tool сразу после tool call.
     """
-    batch_text = sys.stdin.read()
-    batch = json.loads(batch_text)
+    with open(file_path, 'r', encoding='utf-8') as f:
+        response = json.load(f)
+
+    cr_key = response.get('key')
+    if not cr_key:
+        cr_key = os.path.basename(file_path).replace('.json', '')
 
     with open(enriched_path, 'r', encoding='utf-8') as f:
         enriched = json.load(f)
 
-    by_key = {item['cr_key']: item['timing'] for item in batch}
-    updated = 0
-    for task in enriched['tasks']:
-        if task['cr_key'] in by_key:
-            task['timing'] = by_key[task['cr_key']]
-            updated += 1
-
-    with open(enriched_path, 'w', encoding='utf-8') as f:
-        json.dump(enriched, f, indent=2, ensure_ascii=False)
-    
-    print(f"Merged timing for {updated} active tasks")
-
-def compute_from_response(enriched_path='pipeline/enriched.json'):
-    """Принять через stdin {cr_key, response} — где response это ответ MCP с changelog.
-    Посчитать timing через compute_timing() и записать в enriched.json.
-    
-    Использование:
-        echo '{"cr_key": "...", "response": {...полный JSON от MCP...}}' \
-            | python3 helper.py compute-from-response
-    
-    Это удобнее чем agent сам формирует timing — он передаёт сырой response,
-    Python применяет алгоритм."""
-    payload = json.loads(sys.stdin.read())
-    cr_key = payload['cr_key']
-    response = payload['response']
-
-    with open(enriched_path, 'r', encoding='utf-8') as f:
-        enriched = json.load(f)
-    
-    # Найти задачу и получить created/resolutiondate из jira
     task = None
     for t in enriched['tasks']:
         if t['cr_key'] == cr_key:
             task = t
             break
-    
+
     if not task:
         print(f"ERROR: cr_key {cr_key} not found in enriched.json", file=sys.stderr)
         sys.exit(1)
-    
+
     jira = task.get('jira') or {}
     task_created = jira.get('created')
     task_resolutiondate = jira.get('resolutiondate')
-    
+
     timing = compute_timing(response, task_created, task_resolutiondate)
     task['timing'] = timing
-    
+
     with open(enriched_path, 'w', encoding='utf-8') as f:
         json.dump(enriched, f, indent=2, ensure_ascii=False)
-    
+
     p = timing['phase_days']
-    print(f"{cr_key}: A={p['A']} R={p['R']} T={p['T']} (transitions={timing.get('transitions_count', 0)})")
+    mark = '✓' if timing.get('computed') else '✗'
+    reason = timing.get('reason', '')
+    reason_str = f" reason={reason}" if reason else ''
+    print(f"{mark} {cr_key}: A={p['A']} R={p['R']} T={p['T']} "
+          f"(transitions={timing.get('transitions_count', 0)}){reason_str}")
+
+def cleanup_tmp(tmp_dir='pipeline/tmp'):
+    """Удалить файлы из pipeline/tmp/."""
+    if not os.path.isdir(tmp_dir):
+        print(f"Directory {tmp_dir} does not exist, nothing to clean")
+        return
+    files = glob.glob(os.path.join(tmp_dir, '*.json'))
+    for f in files:
+        os.remove(f)
+    print(f"Cleaned {len(files)} files from {tmp_dir}")
 
 def finalize(enriched_path='pipeline/enriched.json'):
     """Обновить metadata.skills_completed."""
     with open(enriched_path, 'r', encoding='utf-8') as f:
         enriched = json.load(f)
-    
+
     enriched['metadata']['timing_at'] = now_iso()
     completed = enriched['metadata'].setdefault('skills_completed', [])
     if 'timing-analyzer' not in completed:
         completed.append('timing-analyzer')
-    
+
     tasks = enriched['tasks']
     stats = {
         'tasks_total': len(tasks),
-        'tasks_active_computed': sum(1 for t in tasks 
+        'tasks_active_computed': sum(1 for t in tasks
                                        if (t.get('timing') or {}).get('computed')),
-        'tasks_inactive_or_no_changelog': sum(1 for t in tasks 
+        'tasks_inactive_or_no_changelog': sum(1 for t in tasks
                                                 if t.get('timing') and not t['timing'].get('computed')),
     }
     enriched['metadata']['timing_stats'] = stats
-    
+
     with open(enriched_path, 'w', encoding='utf-8') as f:
         json.dump(enriched, f, indent=2, ensure_ascii=False)
-    
+
     print(json.dumps(stats, ensure_ascii=False))
 
 def write_step3_markdown(enriched_path='pipeline/enriched.json',
@@ -406,23 +459,22 @@ def write_step3_markdown(enriched_path='pipeline/enriched.json',
     """Создать читаемый snapshot после timing-analyzer."""
     with open(enriched_path, 'r', encoding='utf-8') as f:
         enriched = json.load(f)
-    
+
     tasks = enriched['tasks']
     computed_tasks = [t for t in tasks if (t.get('timing') or {}).get('computed')]
-    
+
     md = []
     md.append("# Снимок после timing-analyzer\n")
     md.append(f"**Дата:** {enriched['metadata'].get('timing_at')}\n")
     md.append(f"**Активных задач с timing:** {len(computed_tasks)}\n")
     md.append(f"**Без changelog или неактивных:** {len(tasks) - len(computed_tasks)}\n")
-    
-    # Сортируем по максимальной фазе по убыванию
+
     def max_phase(t):
         p = (t.get('timing') or {}).get('phase_days') or {}
         return max(p.get('A', 0), p.get('R', 0), p.get('T', 0))
-    
+
     sorted_tasks = sorted(computed_tasks, key=max_phase, reverse=True)
-    
+
     md.append("\n## Топ-10 задач с самыми долгими фазами\n")
     md.append("| CR | Статус | Факт А (д) | Факт Р (д) | Факт Т (д) | План А/Р/Т |")
     md.append("|-----|--------|------------|------------|------------|-------------|")
@@ -435,12 +487,14 @@ def write_step3_markdown(enriched_path='pipeline/enriched.json',
             return str(int(v)) if v is not None else '0'
         plan_str = f"{fmt(plan.get('analytics'))}/{fmt(plan.get('development'))}/{fmt(plan.get('testing'))}"
         md.append(f"| {cr} | {status} | {int(p['A'])} | {int(p['R'])} | {int(p['T'])} | {plan_str} |")
-    
+
     md.append("\n## Следующий шаг\n")
     md.append("Запустить `report-builder` — соберёт финальный `report.md`.")
-    
+
     with open(md_path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(md))
+
+    print(f"Created {md_path}")
 
 # === Main ===
 
@@ -450,50 +504,66 @@ if __name__ == '__main__':
         list_active()
     elif cmd == 'fill-inactive':
         fill_inactive()
-    elif cmd == 'compute-from-response':
-        compute_from_response()
-    elif cmd == 'merge-batch':
-        merge_timing_batch()
+    elif cmd == 'compute-from-file':
+        if len(sys.argv) < 3:
+            print("Usage: python3 helper.py compute-from-file <path>", file=sys.stderr)
+            sys.exit(1)
+        compute_from_file(sys.argv[2])
+    elif cmd == 'cleanup-tmp':
+        cleanup_tmp()
     elif cmd == 'finalize':
         finalize()
     elif cmd == 'write-step3':
         write_step3_markdown()
     else:
-        print("Usage: python3 helper.py [list-active|fill-inactive|compute-from-response|merge-batch|finalize|write-step3]")
+        print("Usage: python3 helper.py [list-active|fill-inactive|compute-from-file <path>|cleanup-tmp|finalize|write-step3]")
         sys.exit(1)
 ```
 
 **Главное про этот код:**
-- `compute_timing(response, created, resolutiondate)` — главная функция расчёта, **алгоритм валидирован**
-- `compute-from-response` — самый удобный entry point: агент передаёт сырой ответ MCP, Python сам считает
-- Возвраты задачи в один статус суммируются автоматически (это правильно)
-- Работа с часовыми поясами через `parse_iso`
+- `extract_status_transitions(changelog_list)` принимает значение поля **`changelogs`** напрямую — плоский список без `histories`
+- Фильтрует **только** `field == 'status'` (игнорирует Link и другие)
+- Для status-переходов читает поля **`fromString`/`toString`** (camelCase)
+- `compute_from_file` — основной entry-point. Читает файл записанный агентом через WriteFile.
+- НЕ читает stdin (раньше пытался — не работало для больших ответов)
 
-## 6. Steps — как агент работает в чате
+## 8. Steps — что делает агент в чате
 
-### Step 1. Валидация
+### Step 1. Получить список активных задач
 
 ```bash
 python3 ~/.gigacode/skills/timing-analyzer/helper.py list-active
 ```
 
-helper выведет JSON-массив cr_keys активных задач — те для которых нужен changelog. Например `["CRSIGMA-23749", "ASFC-58741", ...]`.
+helper выведет JSON-массив cr_keys активных задач. Например `["CRSIGMA-26516", "ASFC-58741", ...]`.
 
-Если файл не существует или `jira-enricher` не отработал — helper упадёт с понятной ошибкой. Сообщить пользователю запустить предшественника.
+Сохранить этот список — итерируем по нему в Step 4.
 
-### Step 2. Заполнить тривиальный timing для неактивных задач
+### Step 2. Заполнить тривиальный timing для не-активных
 
 ```bash
 python3 ~/.gigacode/skills/timing-analyzer/helper.py fill-inactive
 ```
 
-helper пройдёт по всем не активным задачам, запишет `timing.computed = false`, нули в `phase_days`.
+helper пройдёт по всем не-активным задачам, запишет `timing.computed = false`, нули.
 
-### Step 3. Для каждой активной задачи — нативный tool call + compute
+### Step 3. Создать временную директорию
 
-Для каждого `cr_key` из списка активных:
+Через Shell:
 
-**Step 3.1.** Агент в чате делает нативный tool call:
+```bash
+mkdir -p pipeline/tmp
+```
+
+**Только** рабочая директория. **Не** `~/.gigacode/tmp/`.
+
+### Step 4. Streaming-цикл по активным задачам
+
+**Главная часть скилла.** Для каждой `cr_key` из списка активных (по одной, последовательно):
+
+#### Step 4.1. Tool call с changelog
+
+Нативный tool call агента:
 
 ```
 Tool: jira_get_issue
@@ -502,146 +572,189 @@ expand = "changelog"
 fields = "summary,status,created,updated,resolutiondate"
 ```
 
-**Step 3.2.** Агент видит JSON-ответ в контексте (включая `changelog.histories`).
+#### Step 4.2. WriteFile ответа в файл
 
-**Step 3.3.** Передаёт ответ в helper для расчёта через bash:
+Сразу после получения ответа — через **встроенный WriteFile tool агента**:
+
+```
+Tool: WriteFile
+path = "pipeline/tmp/<cr_key>.json"
+content = <сырой JSON-ответ от jira_get_issue, без модификаций>
+```
+
+**Запрещено:**
+- `echo '...' > file.json` через bash — длина команды и кавычки сломают
+- `python3 -c "..."` с JSON в коде — то же
+- Запись в `~/.gigacode/tmp/` — Filesystem Guard блокирует
+
+**Только WriteFile tool + рабочая директория.**
+
+#### Step 4.3. Compute через helper
 
 ```bash
-echo '<JSON: {"cr_key": "...", "response": <полный JSON от MCP>}>' \
-    | python3 ~/.gigacode/skills/timing-analyzer/helper.py compute-from-response
+python3 ~/.gigacode/skills/timing-analyzer/helper.py compute-from-file pipeline/tmp/<cr_key>.json
 ```
 
 helper.py:
-- Парсит JSON со stdin
-- Извлекает changelog
-- Применяет `compute_timing()` — алгоритм построения timeline и агрегации phase_days
+- Читает JSON-файл с диска
+- Извлекает `changelogs` (множественное число)
+- Применяет `compute_timing` — строит timeline, агрегирует phase_days
 - Записывает результат в `pipeline/enriched.json`
-- Печатает короткую сводку в stdout (например: "CRSIGMA-23749: A=30 R=240 T=0")
+- Печатает короткую сводку: `✓ CRSIGMA-26516: A=87.0 R=0.0 T=0.0 (transitions=3)`
 
-Агент видит вывод, продолжает со следующей задачей.
+#### Step 4.4. Следующая задача
 
-**Пауза 0.2 сек** между задачами (rate limit).
+Прогресс пользователю каждые 3 задачи: "Обработано 3/24".
 
-**Прогресс** каждые 3 задачи: "Обработано 3/14".
+**КРИТИЧНО:** не накапливать tool-результаты в контексте. Строго: tool call → WriteFile → Shell-helper → следующая задача. После Step 4.3 JSON-ответ MCP **больше не нужен в контексте** — он на диске и обработан.
 
-### Step 4. Финализация
+### Step 5. Финализация
 
 ```bash
 python3 ~/.gigacode/skills/timing-analyzer/helper.py finalize
 ```
 
-Обновляет `metadata.timing_at`, добавляет `"timing-analyzer"` в `skills_completed`, заполняет `timing_stats`.
+Обновляет metadata, печатает JSON со статистикой.
 
-### Step 5. Создать markdown-снимок
+### Step 6. Создать markdown-снимок
 
 ```bash
 python3 ~/.gigacode/skills/timing-analyzer/helper.py write-step3
 ```
 
-Создаст `pipeline/step-3-after-timing-analyzer.md` с топ-10 самых долгих фаз.
+### Step 7. Очистка tmp (опционально)
 
-### Step 6. Сводка пользователю
+```bash
+python3 ~/.gigacode/skills/timing-analyzer/helper.py cleanup-tmp
+```
+
+Удалит файлы из `pipeline/tmp/`. Для дебага можно пропустить.
+
+### Step 8. Сводка пользователю
 
 В чат:
-- Активных задач с timing: N
-- Без changelog или неактивных: M
-- Топ-3 самых долгих по факту: краткий список
-- Созданы файлы:
-  - `pipeline/enriched.json` (обновлён)
-  - `pipeline/step-3-after-timing-analyzer.md`
+- Активных задач с timing: N из M
+- Без changelog: K
+- Топ-3 самых долгих по факту
+- Созданы файлы: `pipeline/enriched.json` (обновлён), `pipeline/step-3-after-timing-analyzer.md`
 - Следующий шаг: запустите `report-builder`
 
-## 7. КРИТИЧНО: формат вызова MCP
+## 9. КРИТИЧНО: архитектура передачи данных
 
 ### ПРАВИЛЬНО
 
 ```
-Шаг 3.1. Сделать tool call:
-  Tool: jira_get_issue
-  key = <cr_key>
-  expand = "changelog"
-  fields = "summary,status,created,updated,resolutiondate"
+Step 4.1. Tool call: jira_get_issue(key, expand="changelog", fields="...")
+   → агент получает JSON в контекст
 
-Получить JSON-ответ. Передать в helper через bash + stdin:
+Step 4.2. Tool: WriteFile
+   path = "pipeline/tmp/<cr_key>.json"
+   content = <JSON-ответ>
+   → JSON на диске в рабочей директории
 
-echo '{"cr_key": "<cr_key>", "response": <ответ MCP как есть>}' \
-    | python3 ~/.gigacode/skills/timing-analyzer/helper.py compute-from-response
+Step 4.3. Shell:
+   python3 ~/.gigacode/skills/timing-analyzer/helper.py compute-from-file pipeline/tmp/<cr_key>.json
+   → helper прочитал, посчитал, обновил enriched.json
 ```
 
 ### ❌ НЕПРАВИЛЬНО
 
 ```python
-# MCP нельзя вызвать из Python!
-result = mcp__Atlassian__jira_get_issue(key="...", expand="changelog")
-# NameError
+# Нельзя вызвать MCP из Python
+result = mcp__Atlassian__jira_get_issue(key="...")  # NameError
 ```
 
-Граница: tool call → агент видит JSON → bash + stdin → Python считает.
+```bash
+# Нельзя передавать большой JSON через echo — кавычки и длина команды
+echo '{...огромный JSON...}' | python3 helper.py
+```
 
-## 8. Файлы
+```
+# Нельзя писать в .gigacode/
+WriteFile path="~/.gigacode/tmp/file.json"  # Filesystem Guard denied
+```
+
+```
+# Нельзя копить ответы в контексте
+Шаг 1: 24 tool calls подряд
+Шаг 2: потом обрабатываем все
+# Контекст переполнится после 5-7 ответов
+```
+
+## 10. Файлы
 
 | Файл | Назначение |
 |------|------------|
-| `pipeline/enriched.json` | Читается, перезаписывается с полем `timing` для активных задач |
+| `pipeline/enriched.json` | Читается, перезаписывается с полем `timing` |
 | `pipeline/step-3-after-timing-analyzer.md` | Читаемый snapshot |
-| `helper.py` | CLI с подкомандами `list-active`, `fill-inactive`, `compute-from-response`, `merge-batch`, `finalize`, `write-step3` |
+| `pipeline/tmp/<cr_key>.json` | Временные файлы с сырыми ответами MCP. Удаляются в Step 7. |
+| `helper.py` | CLI с подкомандами |
 
 ### Запрещённые файлы
 
-Только `helper.py`, никаких `main.py`, `process.py`, `run_*.py`, `generate_*.py`, `__pycache__`, виртуальных окружений.
+- `main.py`, `process.py`, `run_*.py`, `generate_*.py` — только helper.py
+- **Конкретно запрещены:** `process_timing.py`, `run_timing.sh`, `batch_timing.json` — GigaCode создавал их в прошлых попытках
+- `__pycache__`, `requirements.txt`, виртуальные окружения
 
-## 9. Guardrails
+## 11. Guardrails
 
 - READ-ONLY для Jira (только `jira_get_issue` с `expand=changelog`)
-- НЕ обрабатывать неактивные задачи через MCP — экономим контекст
-- НЕ хранить сырой changelog в json — только phase_days
-- НЕ изменять поле `task.jira` (это работа jira-enricher)
-- НЕ выдумывать timing для задач без changelog — `computed: false`
+- НЕ обрабатывать неактивные задачи через MCP — для них `fill-inactive`
+- НЕ хранить сырой changelog в `enriched.json` — только агрегированные `phase_days`
+- НЕ копить tool-ответы в контексте — streaming через файл
+- НЕ изменять поле `task.jira`
+- Запись JSON ТОЛЬКО через WriteFile в рабочую директорию
 
-## 10. Edge cases
+## 12. Edge cases
 
 | Ситуация | Поведение |
 |----------|-----------|
-| jira-enricher не отработал | helper упадёт с ошибкой на list-active, агент сообщит пользователю |
+| jira-enricher не отработал | helper упадёт на list-active, агент сообщит пользователю |
 | 0 активных задач | fill-inactive заполняет всем тривиальный timing, переходим к finalize и step3 |
-| changelog без переходов статусов (только labels, sprint) | `computed: false`, `reason: "no_status_transitions"` |
+| `changelogs` отсутствует в ответе | `computed: false`, `reason: "no_changelog"` |
+| `changelogs` есть, но без переходов status | `computed: false`, `reason: "no_status_transitions"` |
 | `from_string` первого перехода пустой | helper использует `to_string` как initial_status |
-| `resolutiondate` есть но статус не finished | helper использует resolved как end (странно, но не критично) |
-| Возвраты в статус | Алгоритм сам суммирует — это нормально |
-| Очень старая задача (798 дней) | changelog может быть большим — это нормально |
-| Часовые пояса в timestamps | helper.parse_iso учитывает |
+| `resolutiondate` есть но статус не finished | helper использует resolved как end |
+| Возвраты в один статус | Алгоритм суммирует — это правильно |
+| Очень старая задача (798 дней) | changelog большой — нормально, файл на диске, не в контексте |
+| Часовые пояса в timestamps | `parse_iso` учитывает |
 | Задача создана в `In Progress` | from_string первого перехода пустой, обрабатывается |
-| Timing уже посчитан (повторный запуск) | Перезаписать |
+| Timing уже посчитан (повторный запуск) | Перезаписывается |
+| Файл `pipeline/tmp/<key>.json` существует от предыдущего прогона | WriteFile перезаписывает, или сначала cleanup-tmp |
 
-## 11. Антипаттерны
+## 13. Антипаттерны
 
 ### Критические
 
-- **Вызывать MCP из Python** (`mcp__Atlassian__jira_get_issue`, `from mcp_atlassian import`) — невозможно, NameError
-- **Запросить changelog для всех 28 задач** — лишние ~20 запросов, не нужно
+- **Вызывать MCP из Python** — NameError
+- **Читать ключ `changelog`** (единственное число) — в Сбер-MCP **`changelogs`** (множественное)
+- **Читать `from_string`/`to_string`** для status — в Сбер-MCP **`fromString`/`toString`** (camelCase) для `field='status'`
+- **Передавать большой JSON через echo/stdin** — длина команды и кавычки ломают
+- **Писать в `~/.gigacode/tmp/`** — Filesystem Guard блокирует
+- **Накапливать tool-ответы в контексте перед обработкой** — переполнит при 24 задачах. Streaming!
+- **Запросить changelog для всех 28 задач** — лишние ~20 запросов. Только active.
 - **Использовать `fields="*"` + `expand=changelog`** — катастрофа по контексту
-- **Создавать `main.py`, `process.py`** — только `helper.py`
-- **Передавать batch через CLI-аргумент** — только stdin
-- **Считать timing "примерно" вместо алгоритма** — расхождения будут существенные
+- **Создавать `main.py`, `process_timing.py`, `run_timing.sh`, `batch_timing.json`** или любые другие файлы. Только `helper.py`, `enriched.json`, `step-3.md`, `pipeline/tmp/<key>.json`.
 
 ### Обычные
 
-- Параллельные вызовы Jira — только последовательно
-- Не сортировать transitions перед построением timeline (но helper.extract_status_transitions сам сортирует)
-- Считать дни через `(d2 - d1).days` (отбрасывает часы) вместо `.total_seconds() / 86400`
+- Параллельные tool calls
+- Считать дни через `(d2 - d1).days` — отбрасывает дробную часть, нужно `total_seconds() / 86400`
 - Игнорировать часовые пояса
+- Не делать пауз между tool calls
 
-## 12. Критерий успеха
+## 14. Критерий успеха
 
 После запуска:
 1. `pipeline/enriched.json` валиден, у каждой задачи поле `timing` заполнено
-2. У активных задач `timing.computed = true` (если был changelog)
-3. У неактивных `timing.computed = false`, `phase_days` нули
+2. У активных задач `timing.computed = true` с реальными числами в `phase_days`
+3. У неактивных `timing.computed = false`, нули
 4. `metadata.skills_completed` содержит `[..., "timing-analyzer"]`
 5. Создан `pipeline/step-3-after-timing-analyzer.md`
+6. **Никаких** лишних файлов в проекте
 
-## 13. Что отложено
+## 15. Что отложено
 
-- v3.2: расчёт timing для **finished** задач (для секции "уже закрытые но висели долго")
-- v4: timing с разбивкой по sprint (использует Sprint-переходы из changelog)
-- v6: расчёт **загрузки команд** во времени
+- v3.3: расчёт timing для **finished** задач
+- v4: timing с разбивкой по sprint
+- v6: расчёт загрузки команд во времени

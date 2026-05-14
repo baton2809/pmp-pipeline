@@ -1,246 +1,149 @@
-# pmp-pipeline v3.1 — 4 скилла для контроля портфеля задач
+# jira-enricher v3.2 — второй скилл pipeline
 
-ETL-pipeline из 4 независимых скиллов для GigaCode CLI. Каждый скилл делает одну вещь, скиллы передают данные через **`pipeline/enriched.json`** в рабочей директории. После каждого шага создаётся **видимый markdown-снимок** для проверки промежуточного результата.
+Читает `pipeline/enriched.json`, для каждой задачи запрашивает данные из Jira, агрегирует уникальные эпики и считает их дочерние задачи. Перезаписывает файл с дополнениями и создаёт читаемый снимок.
 
-## Pipeline
+## Изменения v3.2 vs v3.1
 
-```
-┌───────────────────────────────────────────────────────────────────────┐
-│ 1. excel-parser                                                       │
-│    Читает: Бэклог и цели.xlsx (жёстко зафиксирован)                   │
-│    Создаёт:                                                           │
-│       pipeline/enriched.json (план задач)                             │
-│       pipeline/step-1-after-excel-parser.md (читаемый снимок)         │
-│    Без MCP                                                            │
-└───────────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌───────────────────────────────────────────────────────────────────────┐
-│ 2. jira-enricher                                                      │
-│    Читает: pipeline/enriched.json                                     │
-│    MCP: jira_get_issue (БЕЗ changelog) × 28 + jira_search × ~12      │
-│    Архитектура: агент в чате делает tool calls, helper.py через bash │
-│                 принимает batch через stdin и мерджит в файл          │
-│    Дополняет:                                                         │
-│       pipeline/enriched.json — статус, фаза, эпик, команда, lead_time │
-│       pipeline/step-2-after-jira-enricher.md                          │
-└───────────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌───────────────────────────────────────────────────────────────────────┐
-│ 3. timing-analyzer (опционально)                                      │
-│    Читает: pipeline/enriched.json                                     │
-│    MCP: jira_get_issue С expand=changelog для active задач            │
-│    Архитектура: агент передаёт сырой ответ MCP через stdin в helper,  │
-│                 helper.compute_timing считает phase_days              │
-│    Дополняет:                                                         │
-│       pipeline/enriched.json — phase_days {A, R, T} в кален. днях     │
-│       pipeline/step-3-after-timing-analyzer.md                        │
-└───────────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌───────────────────────────────────────────────────────────────────────┐
-│ 4. report-builder                                                     │
-│    Читает: pipeline/enriched.json                                     │
-│    Создаёт: report.md (в корне рабочей директории, не в pipeline/)    │
-│    Без MCP                                                            │
-│    Условный рендеринг: с/без колонок Факт А/Р/Т                       │
-└───────────────────────────────────────────────────────────────────────┘
-```
+**Что пошло не так в v3.1:**
+- 28/28 задач корректно обрабатывались (`task.jira` заполнялся)
+- Но массив `enriched.epics[]` оставался **пустым**
+- Из-за этого секция "Срез по эпикам" в финальном `report.md` показывала `*Эпики не найдены.*`
+- Корневая причина: после цикла `merge_batch` агент не вызывал агрегацию эпиков
 
-## Главные архитектурные решения
+**Что починено в v3.2:**
+- ✅ Новая функция `aggregate_epics()` — собирает уникальные эпики из `task.jira.epic`
+- ✅ Новая функция `update_epic_children(key, count)` — обновляет counter одного эпика
+- ✅ Новая функция `list_epics_to_count` — выводит JSON эпиков без counter (для следующего шага)
+- ✅ Явный шаг в SKILL.md "после всех `merge-batch` — `aggregate-epics`"
+- ✅ Колонка в `step-2-after-jira-enricher.md` — **"Поток"** (не "Команда"), консистентность с финальным отчётом v3.2
+- ✅ `extract_epic` использует `outward_issue` с подчёркиванием (как реально в Сбер-MCP)
+- ✅ Все функции протестированы: идемпотентность, корректность агрегации, сохранение counters при повторном вызове
 
-### 1. Видимая папка `pipeline/` вместо скрытой `.cache/`
-
-В v3.0 была `.cache/` — папка скрыта (точка в начале), пользователь её не видел. **В v3.1** папка называется `pipeline/` — видна в файловом менеджере.
-
-### 2. Per-step markdown снимки
-
-Каждый скилл создаёт `pipeline/step-N-after-<name>.md` — читаемый снимок текущего состояния. Не финальный отчёт, а **промежуточная проверка**. Пользователь может проверить результат каждого шага не открывая JSON.
-
-### 3. Разделение агент ↔ Python через stdin
-
-Это критическое исправление после v3.0 где `jira-enricher` падал с `NameError`.
-
-**Архитектурное правило для скиллов с MCP (jira-enricher, timing-analyzer):**
+## Место в pipeline
 
 ```
-АГЕНТ (GigaCode CLI в чате):
-  ✅ Делает НАТИВНЫЕ tool calls (jira_get_issue, jira_search)
-  ✅ Видит JSON-ответы в своём контексте
-  ✅ Накапливает результаты как текст
-  ✅ После каждого батча — передаёт в helper.py через bash + stdin
-  
-  ❌ НЕ пытается вызвать MCP из Python (это NameError)
-
-PYTHON через bash (helper.py):
-  ✅ Принимает данные через stdin
-  ✅ Парсит JSON, мерджит, пишет файл
-  
-  ❌ НЕ делает MCP-вызовов (физически невозможно)
+1. excel-parser       → pipeline/enriched.json
+2. jira-enricher      ← вы здесь
+3. timing-analyzer
+4. report-builder
 ```
 
-**Граница:** `tool call` → агент видит JSON → `echo '...' | python3 helper.py merge-batch`.
+## Подготовка
 
-### 4. Один helper.py на скилл, никаких лишних файлов
-
-В v3.0 GigaCode создавал 4 Python-файла (`main.py`, `process.py`, `generate_report.py`, `run_jira_v3.py`) и `__pycache__`. **В v3.1** строгое правило: **один** `helper.py`, **никаких** `main.py`, `process.py`, `run_*.py`, `__pycache__`, `requirements.txt`, виртуальных окружений.
-
-### 5. Готовый код helper.py в каждом SPEC.md
-
-Каждый SPEC.md содержит **готовый полный код** `helper.py` — не описание функций, а **рабочий код** который можно скопировать. Это снижает риск что GigaCode что-то напишет криво.
-
-## Структура репозитория
-
-```
-pmp-pipeline/
-├── CONTRACT.md                   ← структура enriched.json (для всех скиллов)
-├── README.md                     ← этот файл
-│
-├── excel-parser/
-│   ├── SPEC.md                   ← 14 разделов, готовый код helper.py в разделе 7
-│   ├── PROMPT.md                 ← для one-shot GigaCode
-│   ├── README.md                 ← инструкция запуска
-│   └── skill/excel-parser/       ← результат one-shot (SKILL.md + helper.py)
-│
-├── jira-enricher/
-│   ├── SPEC.md                   ← готовый код helper.py в разделе 7
-│   ├── PROMPT.md
-│   ├── README.md
-│   └── skill/jira-enricher/
-│
-├── timing-analyzer/
-│   ├── SPEC.md                   ← готовый код helper.py в разделе 5 + алгоритм timeline
-│   ├── PROMPT.md
-│   ├── README.md
-│   └── skill/timing-analyzer/
-│
-└── report-builder/
-    ├── SPEC.md                   ← готовый код helper.py в разделе 5
-    ├── PROMPT.md
-    ├── README.md
-    └── skill/report-builder/
-```
-
-## Подготовка окружения
-
-### MCP
-
-В `~/.gigacode/settings.json` для Atlassian:
+В `~/.gigacode/settings.json`:
 
 ```json
 "includeTools": ["jira_get_issue", "jira_search"]
 ```
 
-### Файлы в рабочей директории
+Перед запуском должен отработать `excel-parser`.
 
-```
-<рабочая_директория>/
-├── Бэклог и цели.xlsx       ← файл Натальи (жёстко зафиксированное имя)
-├── pipeline/                 ← создаётся первым скиллом
-│   ├── enriched.json
-│   ├── step-1-after-excel-parser.md
-│   ├── step-2-after-jira-enricher.md
-│   └── step-3-after-timing-analyzer.md
-└── report.md                 ← финальный отчёт от report-builder
-```
+## Запуск
 
-## Запуск pipeline
-
-### Установка скиллов (one-shot для каждого + перенос в gigacode)
+### Шаг 1. Сгенерировать
 
 ```bash
-# Скилл 1
-cd excel-parser
+cd jira-enricher
 gigacode
-# вставь PROMPT.md, получи skill/excel-parser/{SKILL.md, helper.py}
-# проверь глазами: 2 файла, нет main.py, использован openpyxl, поиск по имени
-cp -r skill/excel-parser ~/.gigacode/skills/
+```
 
-# Скилл 2
-cd ../jira-enricher
-gigacode
-# проверь: 2 файла, нет mcp__... в Python, batch через stdin, customfield_22200 как массив
+Вставить промпт из `PROMPT.md`.
+
+### Шаг 2. Проверить перед установкой
+
+В `skill/jira-enricher/` должно быть **ровно 2 файла**:
+
+**Главные проверки (после v3.1 был корень провала):**
+- В helper.py есть **3 новые функции**: `aggregate_epics`, `update_epic_children`, `list_epics_to_count`
+- CLI entry-points включают: `aggregate-epics`, `update-epic-children`, `list-epics-to-count`
+- В SKILL.md есть **ЯВНЫЙ Step 3** "после всех `merge-batch` — `aggregate-epics`"
+- В SKILL.md есть **ЯВНЫЙ Step 5** "для каждого эпика — `jira_search` + `update-epic-children`"
+- В `write_step2_markdown` колонка таблицы называется **"Поток"** (не "Команда")
+
+**Архитектурные (не сломаны с v3.1):**
+- В SKILL.md tool call описан на естественном языке
+- В helper.py **НЕТ** `mcp__Atlassian__jira_get_issue` или `from mcp_atlassian import`
+- Batching по 5 задач: `echo '...' | python3 helper.py merge-batch`
+- `extract_team` обрабатывает `customfield_22200` как массив строк `["PALM.CSP.K7M"]`
+- `extract_epic` ищет `outward_issue` (с подчёркиванием!) для CRSIGMA-задач
+- `fields=` точный список (не `"*"`), нет `expand="changelog"`
+
+### Шаг 3. Установить и запустить
+
+```bash
 cp -r skill/jira-enricher ~/.gigacode/skills/
-
-# Скилл 3
-cd ../timing-analyzer
 gigacode
-# проверь: 2 файла, нет mcp__... в Python, expand=changelog, нет changelog для неактивных
-cp -r skill/timing-analyzer ~/.gigacode/skills/
-
-# Скилл 4
-cd ../report-builder
-gigacode
-# проверь: 2 файла, нет MCP, условный рендеринг
-cp -r skill/report-builder ~/.gigacode/skills/
 ```
 
-### Прогон
+В чате: "запусти jira-enricher".
 
-В рабочей директории (где `Бэклог и цели.xlsx`):
+## Сколько времени занимает
+
+- 28 задач × `jira_get_issue` + паузы = ~30 сек (батчи по 5)
+- + до 15 эпиков × `jira_get_issue` для имён = ~10 сек
+- + ~10-15 эпиков × `jira_search` для дочерних = ~15 сек
+
+Итого ~1 минута.
+
+## Проверка результата
 
 ```bash
-gigacode
+cat pipeline/step-2-after-jira-enricher.md | head -50
 ```
 
-В чате последовательно:
+```bash
+python3 -c "
+import json
+d = json.load(open('pipeline/enriched.json'))
+print('Skills:', d['metadata']['skills_completed'])
+print('Tasks:', len(d['tasks']))
+print('Tasks with jira:', sum(1 for t in d['tasks'] if (t.get('jira') or {}).get('found')))
+print('Epics:', len(d.get('epics', [])))  # ГЛАВНОЕ — должно быть > 0
+for e in d.get('epics', [])[:5]:
+    cnt = e.get('children_count_total')
+    print(f'  {e[\"key\"]}: from_plan={len(e[\"tasks_from_plan\"])} children={cnt}')
+"
+```
 
-1. `запусти excel-parser` → `pipeline/enriched.json` + `pipeline/step-1-after-excel-parser.md` (28 задач)
-2. `запусти jira-enricher` → дополнен Jira-данными, создан `step-2-after-jira-enricher.md`
-3. `запусти timing-analyzer` → дополнен фактом А/Р/Т, создан `step-3-after-timing-analyzer.md`
-4. `запусти report-builder` → `report.md` в корне
+Должно вывести:
+```
+Skills: ['excel-parser', 'jira-enricher']
+Tasks: 28
+Tasks with jira: ~26-28
+Epics: ~10-15        ← ЭТО ГЛАВНОЕ. Если 0 — баг.
+  ASFC-57216: from_plan=2 children=38
+  ASFC-65543: from_plan=6 children=15
+  ...
+```
 
-**Время полного pipeline:** 3-5 минут.
+## Если массив эпиков пустой
 
-После каждого шага можно открыть соответствующий `step-N.md` и проверить промежуточный результат.
+**Корневой баг v3.1.** Если после прогона `Epics: 0`, значит шаг `aggregate-epics` пропущен в SKILL.md.
 
-## Что показать Наталье
+**Быстрое решение** (без перегенерации скилла):
+```bash
+python3 ~/.gigacode/skills/jira-enricher/helper.py aggregate-epics
+python3 ~/.gigacode/skills/jira-enricher/helper.py write-step2
+```
 
-После полного pipeline:
+Это **идемпотентно** — можно запускать сколько угодно раз. Дальше для каждого эпика нужно сделать `jira_search` руками (или попросить агента) + `update-epic-children`.
 
-1. Открыть `report.md` в редакторе с поддержкой markdown
-2. Главные секции для разговора:
-   - **Дисклеймер** "Что в отчёте и чего нет" — проговорить ограничения
-   - **Секция 5 "Застрявшие"** (если есть timing) — конкретный список задач для разбора
-   - **Секция 3 "Срез по эпикам"** — обзор работы
-   - **Секция 4 "Срез по командам"** — кто чем загружен
+**Правильное решение:** перегенерировать SKILL.md по `PROMPT.md` v3.2 с явным упором на разделы 10 и 15 SPEC.md.
 
-3. Спросить:
-   - Это полезный взгляд?
-   - Какие пороги маркера ⚠ лучше (× 2 от плана)?
-   - Хочется ли v4 (контроль дат ИФТ/ПСИ/ПРОМ)?
+## Если что-то ещё пошло не так
 
-## Roadmap
+| Симптом | Действие |
+|---------|----------|
+| `NameError: mcp__Atlassian__jira_get_issue` | Скилл сгенерил вызов MCP в Python — перегенерировать |
+| Колонка "Поток" пустая или странная | Проверить `extract_team` — должна обрабатывать массив строк |
+| Колонка "Эпик" пустая для ASFC | Проверить что `customfield_11400` в `fields=` |
+| Колонка "Эпик" пустая для CRSIGMA | Проверить fallback на `issuelinks "Implement in"` с `outward_issue` (подчёркивание!) |
+| `Epics: 0` в проверке | Пропущен шаг `aggregate-epics` — см. секцию выше |
+| `update-epic-children` падает с "epic not in enriched.epics" | Пропущен шаг `aggregate-epics` ДО update-epic-children |
+| В таблице step-2 колонка "Команда" | Не обновлён `write_step2_markdown` — перегенерировать |
+| Контекст переполнился | `fields="*"` вместо точного списка. Перегенерировать. |
 
-| Версия | Что добавляется | Куда |
-|--------|------------------|------|
-| **v3.2** | Точечные правки по фидбеку Натальи | в SPEC.md существующих скиллов |
-| **v4** | Контроль плановых дат ИФТ/ПСИ/ПРОМ | новый скилл `dates-enricher` после jira-enricher. customfield известны (24300, 29500, 13700, 22601, 23703) |
-| **v5** | Сберчат-сигналы при отклонениях | новый скилл `sberchat-notifier` после report-builder |
-| **v6** | Развёрнутые дочерние эпиков + загрузка команд | расширение jira-enricher или новый `epic-expander` |
-| **v7** | ML/автооценка БТ | "фантастика" по словам Натальи — не делается |
+## Следующий шаг
 
-## Принципы дизайна
-
-1. **Один скилл — одна вещь.** Если хочется добавить функцию — лучше новый скилл, не раздувать существующий.
-2. **CONTRACT.md — единый источник истины** для структуры `enriched.json`. Изменения в структуре — сначала в CONTRACT.md, потом в коде.
-3. **Только `helper.py`.** Запрещены лишние Python-файлы. SKILL.md — главная точка входа, helper.py — функции.
-4. **MCP-вызовы — нативные tool calls агента**, не Python-обёртки. Граница: tool_call → агент → bash + stdin → helper.
-5. **Жёстко зафиксированы:** имя Excel-файла, имя листа. Колонки ищутся **по имени заголовка** (case-insensitive подстрока).
-6. **Календарные дни ≠ чел-дни** — всегда дисклеймер. Не выдумывать точный факт где его нет.
-7. **Идемпотентность.** Любой скилл можно перезапустить. Перезаписываются только свои поля.
-
-## Что делать если что-то сломалось
-
-| Симптом | Диагноз | Действие |
-|---------|---------|----------|
-| Скилл создал `main.py` или другие лишние `.py` | Антипаттерн критический | Перегенерировать с явной ссылкой на запрет в SPEC.md |
-| `NameError: mcp__Atlassian__jira_get_issue` | Скилл пытается вызвать MCP из Python | Перегенерировать с упором на раздел "КРИТИЧЕСКАЯ АРХИТЕКТУРА" |
-| Контекст переполнился | `fields="*"` или changelog для всех задач | Проверить SPEC раздел 5 (формула вызова) |
-| Колонка "Эпик" пустая | customfield_11400 не в fields= или нет fallback на issuelinks | Проверить SPEC jira-enricher раздел 7 |
-| Колонка "Команда" показывает странное | customfield_22200 обрабатывается не как массив | Проверить extract_team в helper.py |
-| Факт А/Р/Т кривой | Баг в build_timeline или aggregate_phase_days | Сравнить helper.py с готовым кодом в SPEC.md раздел 5 |
-| Маркеры выглядят странно | Пороги не подходят | Обсудить с Натальей, скорректировать SPEC report-builder |
-| `pipeline/enriched.json` пустой | Скилл не дошёл до записи | Проверить логи где упал |
-| Скилл нашёл 3 задачи вместо 28 | Ручной XML-парсинг вместо openpyxl | Перегенерировать с упором на раздел "Антипаттерны критические" |
+- Запустить `timing-analyzer` — добавит факт А/Р/Т из changelog для активных задач
+- Или сразу `report-builder` если факт не нужен

@@ -1,506 +1,771 @@
-# SPEC: excel-parser
+# SPEC: jira-enricher (v3.2)
 
-> Первый скилл pipeline pmp-vs-jira. Читает `Бэклог и цели.xlsx`, лист `Q2_26_оценки_new_name`, извлекает план задач квартала и сохраняет в `pipeline/enriched.json`.
+> Второй скилл pipeline. Читает `pipeline/enriched.json`, для каждой задачи делает `jira_get_issue` БЕЗ changelog, дополняет данными из Jira (статус, эпик, поток, lead time). Затем агрегирует уникальные эпики из всех задач и через `jira_search` подсчитывает дочерние задачи каждого эпика.
 >
-> Никаких вызовов MCP. Только Excel. Это база для следующих скиллов pipeline.
+> **Изменения v3.2 vs v3.1:**
+> 1. Добавлена явная функция `aggregate_epics()` — собирает уникальные эпики из `task.jira.epic` в `enriched.epics[]`. В v3.1 GigaCode сгенерил скилл который **не собирал** эпики в массив, из-за этого секция "Срез по эпикам" в финальном отчёте была пустой.
+> 2. Добавлена функция `update_epic_children(key, count)` — обновляет counter дочерних задач для одного эпика. Используется после каждого `jira_search`.
+> 3. Колонка в `pipeline/step-2-after-jira-enricher.md` — "Поток", не "Команда" (консистентность с финальным отчётом v3.2).
+> 4. Все функции работы с эпиками протестированы на mock-данных — идемпотентны (повторный запуск не теряет counters).
 
-## 1. Контекст и место в pipeline
+---
+
+## 1. Контекст: что пошло не так в v3.1
+
+**Что работало:** агент успешно делал tool calls, helper.merge_batch корректно мерджил `task.jira` для каждой задачи. 28 из 28 задач имели заполненный `task.jira.epic.key`.
+
+**Что не работало:** массив `enriched.epics[]` оставался **пустым**. Причина — после `merge_batch` никто не вызывал агрегацию эпиков. Функция `merge_epics()` была реализована но ожидала массив эпиков через stdin, а агент его не формировал (не было такого шага в SKILL.md).
+
+**Решение v3.2:** Явная команда `aggregate-epics` которая читает уже записанные `task.jira.epic` и собирает их в `enriched.epics[]`. Вызывается агентом одной командой после всех `merge_batch`.
+
+## 2. Архитектура агент↔Python (без изменений с v3.1)
 
 ```
-[Бэклог и цели.xlsx]
-        │
-        ▼
-   excel-parser ◄── (этот скилл)
-        │
-        ▼
-   pipeline/enriched.json
-        │
-        ▼
-   jira-enricher → timing-analyzer → report-builder
+АГЕНТ в чате:
+  - Делает НАТИВНЫЕ tool calls (jira_get_issue, jira_search)
+  - Получает JSON в контекст
+  - Извлекает поля глазами
+  - Передаёт batch в helper через bash + stdin
+
+PYTHON через bash (helper.py):
+  - НЕ делает MCP-вызовов (это NameError)
+  - Принимает данные через stdin
+  - Парсит, мерджит, пишет в pipeline/enriched.json
 ```
 
-## 2. Цели
+**Запрещено для агента:**
+```python
+result = mcp__Atlassian__jira_get_issue(...)  # NameError
+from mcp_atlassian import jira_get_issue       # модуля нет
+```
 
-- Прочитать жёстко зафиксированный файл `Бэклог и цели.xlsx`
-- Найти жёстко зафиксированный лист `Q2_26_оценки_new_name`
-- Извлечь 28 задач квартала с CR-ключами, названиями, инициативами, планом А/Р/Т
-- Создать структуру `enriched.json` согласно CONTRACT.md, секция "После excel-parser"
-- Сохранить в `pipeline/enriched.json` рабочей директории
+## 3. Место в pipeline
 
-## 3. Анти-цели
+```
+1. excel-parser              → pipeline/enriched.json (план)
+2. jira-enricher  ◄── (этот скилл)
+3. timing-analyzer
+4. report-builder
+```
 
-- **НЕ** ходить в Jira (это делает следующий скилл)
-- **НЕ** генерировать markdown-отчёт (это делает `report-builder`)
-- **НЕ** создавать Python-проект — только `helper.py` если необходим
-- **НЕ** работать с другими листами/файлами кроме зафиксированных
+## 4. Цели
 
-## 4. Вход и выход
+- Прочитать `pipeline/enriched.json`, валидировать что `excel-parser` отработал
+- Для каждой задачи с `cr_key` сделать **один** `jira_get_issue` БЕЗ `expand=changelog`
+- Извлечь: статус, фаза, эпик, поток (из `customfield_22200`), lead time
+- После всех задач **агрегировать уникальные эпики** в `enriched.epics[]` (НОВОЕ в v3.2)
+- Для каждого эпика — `jira_search('"Epic Link" = <key>')` для подсчёта дочерних
+- Обновить `metadata.skills_completed`
+- Создать `pipeline/step-2-after-jira-enricher.md` (с колонкой "Поток", не "Команда")
 
-### Вход
+## 5. Анти-цели
 
-- Файл `Бэклог и цели.xlsx` в текущей рабочей директории (жёстко зафиксировано)
-- Лист `Q2_26_оценки_new_name` (жёстко зафиксировано)
+- **НЕ** запрашивать changelog — это работа `timing-analyzer`
+- **НЕ** считать `phase_days`
+- **НЕ** генерировать финальный markdown
+- **НЕ** читать Excel
 
-Если файл отсутствует — сообщить пользователю с точным именем файла, не пытаться найти альтернативы. Если лист отсутствует — то же самое.
+## 6. Формула вызова MCP
 
-### Выход
+### Для каждой задачи
 
-`pipeline/enriched.json` в текущей рабочей директории. Структура — см. CONTRACT.md секция "После excel-parser".
+```
+Tool: jira_get_issue
+key = <cr_key>
+fields = "summary,issuetype,status,project,created,updated,resolutiondate,
+          reporter,assignee,priority,labels,description,parent,
+          customfield_11400,customfield_22200,issuelinks"
+```
 
-Папку `pipeline/` создать если не существует.
+КРИТИЧНО:
+- **НЕ** передавать `expand=changelog` (это работа следующего скилла)
+- **НЕ** использовать `fields="*"` (раздувает контекст)
+- Это нативный tool call агента
 
-## 5. Структура Excel — поиск колонок по имени заголовка
+### Для каждого уникального эпика
 
-**КРИТИЧНО:** колонки находятся **по имени в строке заголовков** (case-insensitive, по подстроке), **НЕ по фиксированной букве колонки**. Это решение проверено в v2 (`pmp-vs-jira-light`) — там нашли все 28 задач именно через поиск по имени.
+После агрегации эпиков:
 
-**Почему НЕ по позиции букв (B, C, F, G, ...):** в xlsx XML пустые ячейки физически пропускаются. Если ваш парсер не использует `openpyxl` (который сам это нормализует), а парсит XML вручную — индексы колонок поедут. Поиск по имени защищает от этой проблемы.
+```
+Tool: jira_search
+jql = '"Epic Link" = <epic_key>'
+fields = "summary,status,issuetype"
+maxResults = 100
+```
 
-### Имена колонок которые ищем
+Результат — `len(issues)` это `children_count_total`.
 
-Все имена case-insensitive, поиск по подстроке в значении ячейки заголовка:
+## 7. Mapping статуса → category → phase
 
-| Логическое имя | Поиск по подстроке | Что хранит |
-|----------------|---------------------|------------|
-| `cr` | `'cr'` | CR-ключ Jira (URL или строка) |
-| `task` | `'задача'` | Название задачи |
-| `initiative` | `'инициатива'` | Инициатива (для группировки) |
-| `customer` | `'заказчик'` | Заказчик (опционально) |
-| `analytics` | `'аналитика'` | Оценка А (чд) — встречается ДВА раза (v1 и v2) |
-| `development` | `'разработка'` | Оценка Р (чд) — встречается ДВА раза |
-| `testing` | `'тестирование'` | Оценка Т (чд) — встречается ДВА раза |
+Используется единый mapping из CONTRACT.md.
 
-**Важно про дубликаты колонок:** в файле Натальи колонки `Аналитика`, `Разработка`, `Тестирование` встречаются **дважды** — для первой и второй версии оценок. При поиске собираем **список всех позиций** для каждого имени.
+## 8. Извлечение полей — правила (из реальных данных)
 
-### Логика чтения файла
+### Эпик (порядок поиска)
 
-1. **Открыть файл** через `openpyxl.load_workbook(path, data_only=True)`. **НЕ парсить xlsx как XML вручную** — см. антипаттерны.
-2. **Найти лист** `Q2_26_оценки_new_name`.
-3. **Найти строку заголовков** — первая строка где есть ячейка со значением содержащим `'cr'` (case-insensitive). Обычно это строка 1.
-4. **Распознать позиции колонок** — пройти по ячейкам строки заголовков, для каждого имени из таблицы выше собрать список индексов.
-5. **Найти первую строку данных** — первая строка ПОСЛЕ заголовков где в колонке `cr` есть непустое значение похожее на CR-ключ (regex поиск).
+1. **`fields.customfield_11400`** — для ASFC-задач строка типа `ASFC-65543`
+2. **`fields.issuelinks`** — для CRSIGMA-задач, найти первую с `type.outward == "Implement in"`, взять `outward_issue.key` (с подчёркиванием!)
 
-### Выбор версии плана
+Если ни 1, ни 2 → `epic = {key: null, name: null, source: null}`.
 
-Колонки `аналитика`, `разработка`, `тестирование` встречаются дважды — это две версии плана:
-- **Первая позиция (раньше по индексу)** — первая версия оценок (J/K/L в файле Натальи)
-- **Вторая позиция (позже)** — вторая, актуальная версия (R/S/T)
+### Поток (НЕ "Команда")
 
-Для каждой задачи и каждой фазы (А/Р/Т) — **брать значение из последней непустой позиции**. То есть если v2 заполнена — берём v2, иначе v1.
+1. **`fields.customfield_22200`** — это **массив строк** типа `["PALM.CSP.K7M"]`. Берём первый элемент. Это техническая метка потока, не имя команды.
+2. Если пусто — fallback на `fields.assignee.displayName` с пометкой `assignee_fallback`
+3. Если и assignee пуст — `team = {value: null, source: null}`
 
-`source_version`:
-- `"v2"` — если хотя бы одна из фаз взята из второй версии
-- `"v1"` — если все фазы из первой версии
-- `"none"` — если ни одна не заполнена. Задача всё равно попадает в `tasks`, просто без оценок.
-
-### Парсинг CR-ключа
-
-Из значения колонки `cr`:
-1. `str(value).strip()` — преобразовать в строку и убрать пробелы
-2. Если пусто или `None` → задача без CR, **в `tasks` НЕ добавляется**, регистрируется в `metadata.skipped_rows`
-3. Применить regex `r'(ASFC|CRSIGMA|OCRED|TIBDS|ASFS)-\d+'` через `re.search` (НЕ `re.match` — нужен поиск подстроки, потому что CR может быть в URL)
-4. Если найдено — `match.group(0)` это ключ
-5. Если не найдено — в `skipped_rows` с пометкой "некорректный формат CR в строке N"
-
-**Примеры что должно работать:**
-- `' https://jira.delta.sbrf.ru/browse/CRSIGMA-26516'` → `CRSIGMA-26516` ✓
-- `'https://jira.delta.sbrf.ru/browse/CRSIGMA-23749'` → `CRSIGMA-23749` ✓
-- `'ASFC-58741'` → `ASFC-58741` ✓
-- `'TIBDS-8245'` → `TIBDS-8245` ✓
-- `'Какой-то текст'` → пропуск, в skipped_rows
-- `None` или `''` → пропуск, в skipped_rows
-
-## 6. Steps
-
-### Step 1. Проверить файл
-
-Проверить что `Бэклог и цели.xlsx` существует в текущей директории. Если нет — сообщение пользователю:
-
-> Файл `Бэклог и цели.xlsx` не найден в текущей директории. Убедитесь что вы запустили GigaCode в правильной папке.
-
-Завершить.
-
-### Step 2. Открыть лист
-
-Открыть лист `Q2_26_оценки_new_name`. Если листа нет — перечислить доступные листы, попросить пользователя проверить. Завершить.
-
-Реализация — через `helper.py` функция `open_sheet()` использующая `openpyxl.load_workbook(..., data_only=True)`.
-
-### Step 3. Найти строку заголовков и распознать колонки
-
-Через `helper.find_headers(worksheet)`:
-
-1. Идти по строкам от 1 до 5 (заголовки обычно в начале)
-2. Для каждой строки проверить — есть ли в ней ячейка со значением содержащим `'cr'` (case-insensitive)
-3. Первая такая строка — строка заголовков
-4. Запомнить её номер как `header_row`
-
-Через `helper.detect_columns(worksheet, header_row)`:
-
-5. Пройти по всем ячейкам строки `header_row` (от колонки 1 до `worksheet.max_column`)
-6. Для каждой ячейки взять значение, привести к строке, lowercase, strip
-7. Если значение содержит `'cr'` — добавить индекс в `columns['cr']`
-8. Если содержит `'задача'` — `columns['task']`
-9. Аналогично для `'инициатива'`, `'заказчик'`, `'аналитика'`, `'разработка'`, `'тестирование'`
-10. Вернуть словарь `columns: Dict[str, List[int]]` — для каждого имени список найденных индексов колонок
-
-**Валидация:**
-- Если `columns['cr']` пуст — сообщить "не найдена колонка CR в строке заголовков", завершить
-- Если `columns['task']` пуст — продолжить, в отчёте у задач `task_name = ''`, в `metadata` пометка
-- Если `columns['analytics']` имеет 0 элементов — продолжить, план будет null
-
-### Step 4. Найти первую строку данных
-
-Через `helper.find_first_data_row(worksheet, header_row, cr_col_indices)`:
-
-1. Идти со строки `header_row + 1` до `worksheet.max_row`
-2. Для каждой строки проверить **все** колонки из `columns['cr']` (может быть несколько)
-3. Первая строка где **хотя бы в одной из cr-колонок** есть значение содержащее regex `(ASFC|CRSIGMA|OCRED|TIBDS|ASFS)-\d+` — это начало данных
-4. Запомнить как `first_data_row`
-
-### Step 5. Пройти по строкам, извлечь задачи
-
-Для каждой строки от `first_data_row` до `worksheet.max_row`:
-
-1. **Извлечь CR-ключ:** пройти по `columns['cr']`, для каждой колонки получить значение, применить парсинг (см. раздел 5 "Парсинг CR-ключа"). Взять **первый успешно распарсенный** ключ.
-2. Если CR не найден — добавить в `metadata.skipped_rows`, продолжить со следующей строки
-3. **Извлечь название** — из первой непустой колонки `columns['task']`, применить `helper.clean_text`
-4. **Извлечь инициативу** — из `columns['initiative']`, очистить
-5. **Извлечь заказчика** — из `columns['customer']` (опционально)
-6. **Извлечь план А/Р/Т** — для каждой фазы пройти по `columns['analytics']` / `['development']` / `['testing']`, **взять последнее непустое числовое значение** (это вторая, актуальная версия)
-   - Если все значения пусты — `null`
-   - Считать `plan.total = (analytics or 0) + (development or 0) + (testing or 0)` если хотя бы одно не null, иначе `null`
-   - Определить `source_version`:
-     - `"v2"` — если хотя бы для одной фазы взято значение НЕ из первой позиции (т.е. была вторая колонка с числом)
-     - `"v1"` — если для всех фаз взято из первой позиции
-     - `"none"` — если все null
-7. **Создать объект `task`** согласно CONTRACT.md секция "После excel-parser":
-   ```json
-   {
-     "cr_key": "<распарсенный ключ>",
-     "task_name": "<название>",
-     "initiative": "<инициатива>",
-     "customer": "<заказчик или null>",
-     "plan": {
-       "analytics": <число или null>,
-       "development": <число или null>,
-       "testing": <число или null>,
-       "total": <сумма или null>,
-       "source_version": "v1" | "v2" | "none"
-     },
-     "jira": null,
-     "timing": null
-   }
-   ```
-8. Добавить в `tasks` массив
-
-### Step 6. Сохранить json и markdown-снимок
-
-1. Создать папку `pipeline/` если её нет (`os.makedirs('pipeline', exist_ok=True)`)
-2. Сформировать полную структуру согласно CONTRACT.md секция "После excel-parser":
-   ```python
-   enriched = {
-     "metadata": {
-       "source_file": "Бэклог и цели.xlsx",
-       "sheet": "Q2_26_оценки_new_name",
-       "parsed_at": "<now ISO 8601>",
-       "enriched_at": None,
-       "timing_at": None,
-       "report_generated_at": None,
-       "scope_version": "v3.1",
-       "skills_completed": ["excel-parser"],
-       "skipped_rows": [...],
-       "tasks_count": len(tasks)
-     },
-     "tasks": [...],
-     "epics": []
-   }
-   ```
-3. Записать в `pipeline/enriched.json`:
-   ```python
-   with open('pipeline/enriched.json', 'w', encoding='utf-8') as f:
-     json.dump(enriched, f, indent=2, ensure_ascii=False)
-   ```
-4. **Создать markdown-снимок** `pipeline/step-1-after-excel-parser.md` — это **видимый** артефакт для пользователя, чтобы он мог сразу проверить результат не открывая json.
-
-   Структура (см. CONTRACT.md секция "step-1-after-excel-parser.md"):
-   - Заголовок: `# Снимок после excel-parser`
-   - Дата, источник, число задач
-   - Таблица всех задач: `#`, `CR`, `Название` (обрезано до 50 символов), `План А/Р/Т (Σ)`, `Версия плана`
-   - Подсказка "Следующий шаг: запустите `jira-enricher`"
-   
-   Реализация — `helper.write_step1_markdown(enriched)`.
-
-### Step 7. Сообщить пользователю
-
-В чат вывести краткую сводку:
-- Обработан файл: `Бэклог и цели.xlsx`, лист `Q2_26_оценки_new_name`
-- Строка заголовков: N
-- Первая строка данных: M
-- Распознано колонок: `cr` (K позиций), `task`, `initiative`, `аналитика` (2 позиции), и т.д.
-- **Извлечено задач: N** ← главное число, должно быть **28** для текущего файла Натальи
-- Пропущено строк (без CR): M
-- Созданы файлы:
-  - `pipeline/enriched.json` (данные для следующих скиллов)
-  - `pipeline/step-1-after-excel-parser.md` (читаемый снимок)
-- Следующий шаг: запустите `jira-enricher`
-
-## 7. Файлы которые скилл может создавать
-
-| Файл | Назначение |
-|------|------------|
-| `pipeline/enriched.json` | Основной выход, согласно CONTRACT.md |
-| `helper.py` (рядом со SKILL.md в `~/.gigacode/skills/excel-parser/`) | Вспомогательные функции |
-
-### Минимальный набор функций которые должны быть в `helper.py`
+## 9. Готовый код helper.py — используйте как основу
 
 ```python
-# helper.py — функции для excel-parser
+# helper.py для jira-enricher v3.2
 
-import openpyxl
-import re
 import json
+import sys
+import re
 import os
 from datetime import datetime, timezone
 
-CR_PATTERN = re.compile(r'(ASFC|CRSIGMA|OCRED|TIBDS|ASFS)-\d+')
+# === Mapping статусов ===
 
-def open_workbook(path: str):
-    """Открыть xlsx через openpyxl. ТОЛЬКО openpyxl, не ручной XML."""
-    return openpyxl.load_workbook(path, data_only=True)
+STATUS_MAP = {
+    'backlog': ('not_started', None),
+    'to do': ('not_started', None),
+    'открыта': ('not_started', None),
+    'new': ('analysis', 'A'),
+    'need info': ('analysis', 'A'),
+    'analysis': ('analysis', 'A'),
+    'анализ': ('analysis', 'A'),
+    'in progress': ('development', 'R'),
+    'разработка': ('development', 'R'),
+    'готов к разработке': ('development', 'R'),
+    'ready for qa': ('testing', 'T'),
+    'готов к тестированию': ('testing', 'T'),
+    'начато тестирование': ('testing', 'T'),
+    'тестирование': ('testing', 'T'),
+    'st': ('testing', 'T'),
+    'ift': ('testing', 'T'),
+    'uat': ('testing', 'T'),
+    'пси': ('testing', 'T'),
+    'проверено на ифт/гот': ('testing', 'T'),
+    'in discovery': ('testing', 'T'),
+    'done': ('finished', None),
+    'resolved': ('finished', None),
+    'closed': ('finished', None),
+    'закрыт': ('finished', None),
+    'закрыты': ('finished', None),
+    'cancelled': ('finished', None),
+}
 
-def get_sheet(workbook, sheet_name: str):
-    """Получить лист по имени."""
-    if sheet_name not in workbook.sheetnames:
+def map_status(status_name):
+    if not status_name:
+        return ('unknown', None)
+    return STATUS_MAP.get(str(status_name).strip().lower(), ('unknown', None))
+
+def parse_iso(s):
+    if not s:
         return None
-    return workbook[sheet_name]
-
-def find_header_row(worksheet, max_search_rows: int = 5) -> int | None:
-    """Найти строку заголовков (первая строка где есть ячейка содержащая 'cr' case-insensitive).
-    Возвращает 1-based индекс строки или None."""
-    for row_idx in range(1, max_search_rows + 1):
-        for col_idx in range(1, worksheet.max_column + 1):
-            value = worksheet.cell(row_idx, col_idx).value
-            if value and 'cr' in str(value).lower():
-                return row_idx
-    return None
-
-def detect_columns(worksheet, header_row: int) -> dict[str, list[int]]:
-    """Распознать позиции колонок по подстроке в заголовке.
-    Возвращает dict где значения — списки индексов (может быть несколько колонок с одинаковым именем)."""
-    name_patterns = {
-        'cr': 'cr',
-        'task': 'задача',
-        'initiative': 'инициатива',
-        'customer': 'заказчик',
-        'analytics': 'аналитика',
-        'development': 'разработка',
-        'testing': 'тестирование',
-    }
-    columns = {key: [] for key in name_patterns}
-    for col_idx in range(1, worksheet.max_column + 1):
-        cell_value = worksheet.cell(header_row, col_idx).value
-        if cell_value is None:
-            continue
-        value_lower = str(cell_value).lower().strip()
-        for key, pattern in name_patterns.items():
-            if pattern in value_lower:
-                columns[key].append(col_idx)
-    return columns
-
-def parse_cr_key(value) -> str | None:
-    """Извлечь CR-ключ из значения ячейки. None если не удалось."""
-    if value is None:
+    s = str(s)
+    if re.search(r'[+-]\d{4}$', s):
+        s = s[:-2] + ':' + s[-2:]
+    try:
+        return datetime.fromisoformat(s)
+    except (ValueError, TypeError):
         return None
-    text = str(value).strip()
-    if not text:
+
+def now_iso():
+    return datetime.now(timezone.utc).astimezone().isoformat()
+
+# === Извлечение полей из ответа MCP ===
+
+def extract_epic(fields):
+    """Эпик: customfield_11400 (ASFC) → fallback на issuelinks 'Implement in' (CRSIGMA)."""
+    cf = fields.get('customfield_11400')
+    if cf and isinstance(cf, str) and re.match(r'^[A-Z]+-\d+$', cf):
+        return {'key': cf, 'name': None, 'source': 'customfield_11400'}
+
+    for link in fields.get('issuelinks', []) or []:
+        link_type = (link.get('type') or {}).get('outward', '')
+        if link_type == 'Implement in':
+            # ВАЖНО: в Сбер-MCP поле называется outward_issue (с подчёркиванием)
+            outward = link.get('outward_issue') or link.get('outwardIssue')
+            if outward:
+                return {
+                    'key': outward.get('key'),
+                    'name': (outward.get('fields') or {}).get('summary'),
+                    'source': 'issuelinks.Implement_in',
+                }
+
+    return {'key': None, 'name': None, 'source': None}
+
+def extract_team(fields, assignee_obj):
+    """Поток (НЕ команда): customfield_22200 (массив строк PALM.*) → fallback на assignee."""
+    cf = fields.get('customfield_22200')
+    if isinstance(cf, list) and len(cf) > 0:
+        first = cf[0]
+        if isinstance(first, str) and first.strip():
+            return {'value': first.strip(), 'source': 'customfield_22200'}
+        if isinstance(first, dict):
+            val = first.get('value') or first.get('name')
+            if val:
+                return {'value': str(val), 'source': 'customfield_22200'}
+
+    display = (assignee_obj or {}).get('displayName') or (assignee_obj or {}).get('display_name')
+    if display:
+        return {'value': display, 'source': 'assignee_fallback'}
+
+    return {'value': None, 'source': None}
+
+def compute_lead_time(fields):
+    created = parse_iso(fields.get('created'))
+    if not created:
         return None
-    match = CR_PATTERN.search(text)  # ВАЖНО: search, не match!
-    return match.group(0) if match else None
+    resolved = parse_iso(fields.get('resolutiondate'))
+    end = resolved if resolved else datetime.now(timezone.utc).astimezone()
+    return (end - created).days
 
-def clean_text(value) -> str:
-    """Очистить текст от \\n, \\r, \\t, свернуть пробелы, strip."""
-    if value is None:
-        return ''
-    text = str(value)
-    text = text.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+def extract_jira_fields(response):
+    """Главная функция извлечения. Принимает ответ jira_get_issue."""
+    if not response:
+        return {'found': False, 'error': 'empty response'}
 
-def extract_plan(row_idx: int, worksheet, columns: dict[str, list[int]]) -> dict:
-    """Извлечь план А/Р/Т для строки. Берёт последнее непустое значение для каждой фазы.
-    Определяет source_version: v2 если хоть одно значение взято не из первой позиции, иначе v1, иначе none."""
-    phases = {'analytics': None, 'development': None, 'testing': None}
-    used_v2_for_any_phase = False
-    
-    for phase_key in phases:
-        positions = columns.get(phase_key, [])
-        # Идём по позициям, последняя непустая — наше значение
-        for i, col_idx in enumerate(positions):
-            cell_value = worksheet.cell(row_idx, col_idx).value
-            if cell_value is not None and cell_value != '':
-                try:
-                    phases[phase_key] = float(cell_value)
-                    if i > 0:  # это не первая позиция, значит взяли из v2 или позже
-                        used_v2_for_any_phase = True
-                except (ValueError, TypeError):
-                    pass  # не число — игнорируем
-    
-    total = None
-    any_filled = any(v is not None for v in phases.values())
-    if any_filled:
-        total = sum((v or 0) for v in phases.values())
-    
-    if not any_filled:
-        source_version = 'none'
-    elif used_v2_for_any_phase:
-        source_version = 'v2'
-    else:
-        source_version = 'v1'
-    
+    fields = response.get('fields', response) if isinstance(response, dict) else {}
+    if not fields:
+        return {'found': False, 'error': 'no fields in response'}
+
+    status_name = (fields.get('status') or {}).get('name')
+    category, phase = map_status(status_name)
+
+    assignee = fields.get('assignee') or {}
+    reporter = fields.get('reporter') or {}
+
     return {
-        'analytics': phases['analytics'],
-        'development': phases['development'],
-        'testing': phases['testing'],
-        'total': total,
-        'source_version': source_version,
+        'found': True,
+        'summary': fields.get('summary'),
+        'status': status_name,
+        'status_category': category,
+        'phase': phase,
+        'issue_type': (fields.get('issuetype') or fields.get('issue_type') or {}).get('name'),
+        'project': (fields.get('project') or {}).get('key'),
+        'priority': (fields.get('priority') or {}).get('name'),
+        'labels': fields.get('labels', []) or [],
+        'created': fields.get('created'),
+        'updated': fields.get('updated'),
+        'resolutiondate': fields.get('resolutiondate'),
+        'assignee': assignee.get('displayName') or assignee.get('display_name'),
+        'reporter': reporter.get('displayName') or reporter.get('display_name'),
+        'epic': extract_epic(fields),
+        'team': extract_team(fields, assignee),
+        'lead_time_days': compute_lead_time(fields),
+        'fetched_at': now_iso(),
     }
 
-def save_enriched(data: dict, path: str = 'pipeline/enriched.json'):
-    """Сохранить JSON в файл, создавая pipeline/ если её нет."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+# === Главные CLI entry-points ===
 
-def write_step1_markdown(enriched: dict, path: str = 'pipeline/step-1-after-excel-parser.md'):
-    """Сохранить читаемый markdown-снимок после excel-parser."""
+def merge_batch(enriched_path='pipeline/enriched.json'):
+    """Принимает batch [{cr_key, jira}] через stdin, мерджит task.jira."""
+    batch_text = sys.stdin.read()
+    batch = json.loads(batch_text)
+
+    with open(enriched_path, 'r', encoding='utf-8') as f:
+        enriched = json.load(f)
+
+    by_key = {item['cr_key']: item['jira'] for item in batch}
+    updated = 0
+    for task in enriched['tasks']:
+        if task['cr_key'] in by_key:
+            task['jira'] = by_key[task['cr_key']]
+            updated += 1
+
+    with open(enriched_path, 'w', encoding='utf-8') as f:
+        json.dump(enriched, f, indent=2, ensure_ascii=False)
+
+    print(f"Merged {updated} tasks into {enriched_path}")
+
+def aggregate_epics(enriched_path='pipeline/enriched.json'):
+    """НОВОЕ В v3.2. Собирает уникальные эпики из task.jira.epic в enriched.epics[].
+    
+    Идемпотентна: повторный вызов сохраняет существующие children_count_total.
+    Вызывается ОДИН РАЗ после всех merge_batch, до jira_search для подсчёта детей.
+    """
+    with open(enriched_path, 'r', encoding='utf-8') as f:
+        enriched = json.load(f)
+
+    # Существующие counters сохраняем (могут быть проставлены ранее)
+    existing = {e['key']: e for e in (enriched.get('epics') or []) if e.get('key')}
+
+    epics_by_key = {}
+    for task in enriched.get('tasks', []):
+        epic = (task.get('jira') or {}).get('epic') or {}
+        key = epic.get('key')
+        if not key:
+            continue
+
+        if key not in epics_by_key:
+            # children_count_total: берём из existing если был, иначе None
+            # (None != 0 — отличаем "не посчитано" от "0 детей")
+            prev_count = existing.get(key, {}).get('children_count_total')
+            epics_by_key[key] = {
+                'key': key,
+                'name': epic.get('name'),
+                'tasks_from_plan': [],
+                'children_count_total': prev_count,
+                'fetched_at': now_iso(),
+            }
+
+        # Обновить имя если в существующем None а в новом есть
+        if not epics_by_key[key].get('name') and epic.get('name'):
+            epics_by_key[key]['name'] = epic.get('name')
+
+        if task['cr_key'] not in epics_by_key[key]['tasks_from_plan']:
+            epics_by_key[key]['tasks_from_plan'].append(task['cr_key'])
+
+    # Сортировка для детерминизма (по убыванию задач, потом по ключу)
+    enriched['epics'] = sorted(epics_by_key.values(),
+                                key=lambda e: (-len(e['tasks_from_plan']), e['key']))
+
+    with open(enriched_path, 'w', encoding='utf-8') as f:
+        json.dump(enriched, f, indent=2, ensure_ascii=False)
+
+    print(f"Aggregated {len(enriched['epics'])} unique epics from tasks")
+
+def update_epic_children(epic_key, children_count, enriched_path='pipeline/enriched.json'):
+    """НОВОЕ В v3.2. Обновить children_count_total для одного эпика.
+    
+    Использование:
+        python3 helper.py update-epic-children ASFC-57216 38
+    
+    Вызывается агентом после каждого jira_search для эпика.
+    """
+    with open(enriched_path, 'r', encoding='utf-8') as f:
+        enriched = json.load(f)
+
+    found = False
+    for epic in enriched.get('epics', []):
+        if epic.get('key') == epic_key:
+            epic['children_count_total'] = int(children_count)
+            epic['fetched_at'] = now_iso()
+            found = True
+            break
+
+    if not found:
+        print(f"ERROR: epic {epic_key} not in enriched.epics. Did you forget aggregate-epics?", 
+              file=sys.stderr)
+        sys.exit(1)
+
+    with open(enriched_path, 'w', encoding='utf-8') as f:
+        json.dump(enriched, f, indent=2, ensure_ascii=False)
+
+    print(f"Updated {epic_key}: children_count_total = {children_count}")
+
+def list_epics_to_count(enriched_path='pipeline/enriched.json'):
+    """Вывести JSON-массив ключей эпиков для которых нужно сделать jira_search.
+    
+    Это эпики у которых children_count_total = None (ещё не посчитано).
+    """
+    with open(enriched_path, 'r', encoding='utf-8') as f:
+        enriched = json.load(f)
+
+    keys = [e['key'] for e in enriched.get('epics', [])
+            if e.get('key') and e.get('children_count_total') is None]
+    print(json.dumps(keys, ensure_ascii=False))
+
+def list_epics_without_names(enriched_path='pipeline/enriched.json', max_count=15):
+    """Вывести JSON-массив ключей эпиков без имени (для опционального догруза).
+    
+    Возвращает только если их меньше max_count — иначе пустой массив (не догружаем).
+    """
+    with open(enriched_path, 'r', encoding='utf-8') as f:
+        enriched = json.load(f)
+
+    keys = [e['key'] for e in enriched.get('epics', [])
+            if e.get('key') and not e.get('name')]
+    if len(keys) > max_count:
+        print(json.dumps([], ensure_ascii=False))
+    else:
+        print(json.dumps(keys, ensure_ascii=False))
+
+def update_epic_name(epic_key, name, enriched_path='pipeline/enriched.json'):
+    """Опционально обновить имя эпика (если получили его отдельным jira_get_issue)."""
+    with open(enriched_path, 'r', encoding='utf-8') as f:
+        enriched = json.load(f)
+
+    for epic in enriched.get('epics', []):
+        if epic.get('key') == epic_key:
+            epic['name'] = name
+            break
+
+    with open(enriched_path, 'w', encoding='utf-8') as f:
+        json.dump(enriched, f, indent=2, ensure_ascii=False)
+
+    print(f"Updated name for {epic_key}: {name}")
+
+def finalize(enriched_path='pipeline/enriched.json'):
+    """Финальная проставка metadata."""
+    with open(enriched_path, 'r', encoding='utf-8') as f:
+        enriched = json.load(f)
+
+    enriched['metadata']['enriched_at'] = now_iso()
+    completed = enriched['metadata'].setdefault('skills_completed', [])
+    if 'jira-enricher' not in completed:
+        completed.append('jira-enricher')
+
+    tasks = enriched['tasks']
+    epics = enriched.get('epics', [])
+    stats = {
+        'tasks_total': len(tasks),
+        'tasks_found': sum(1 for t in tasks if (t.get('jira') or {}).get('found')),
+        'tasks_not_found': sum(1 for t in tasks if t.get('jira') and not t['jira'].get('found')),
+        'tasks_not_processed': sum(1 for t in tasks if t.get('jira') is None),
+        'epics_unique': len(epics),
+        'epics_with_children_count': sum(1 for e in epics if e.get('children_count_total') is not None),
+        'epics_without_children_count': sum(1 for e in epics if e.get('children_count_total') is None),
+    }
+    enriched['metadata']['jira_stats'] = stats
+
+    with open(enriched_path, 'w', encoding='utf-8') as f:
+        json.dump(enriched, f, indent=2, ensure_ascii=False)
+
+    print(json.dumps(stats, ensure_ascii=False))
+
+def write_step2_markdown(enriched_path='pipeline/enriched.json',
+                          md_path='pipeline/step-2-after-jira-enricher.md'):
+    """Создать snapshot. КОЛОНКА 'Поток', НЕ 'Команда'."""
+    with open(enriched_path, 'r', encoding='utf-8') as f:
+        enriched = json.load(f)
+
+    tasks = enriched['tasks']
+    epics = enriched.get('epics', [])
+
     md = []
-    md.append("# Снимок после excel-parser\n")
-    md.append(f"**Дата:** {enriched['metadata']['parsed_at']}\n")
-    md.append(f"**Источник:** {enriched['metadata']['source_file']}, лист {enriched['metadata']['sheet']}\n")
-    md.append(f"**Задач извлечено:** {len(enriched['tasks'])}\n")
-    skipped = len(enriched['metadata'].get('skipped_rows', []))
-    md.append(f"**Пропущено строк (без CR):** {skipped}\n")
-    md.append("\n## Задачи плана\n")
-    md.append("| # | CR | Название | План А/Р/Т (Σ) | Версия плана |")
-    md.append("|---|-----|----------|-----------------|---------------|")
-    for i, task in enumerate(enriched['tasks'], 1):
-        name = (task.get('task_name') or '')[:50]
-        if len(task.get('task_name') or '') > 50:
-            name = name.rsplit(' ', 1)[0] + '…'
-        p = task.get('plan') or {}
-        a = p.get('analytics')
-        r = p.get('development')
-        t = p.get('testing')
-        total = p.get('total')
-        if total is None:
-            plan_str = '—'
-        else:
-            def fmt(v):
-                return str(int(v)) if v is not None else '0'
-            plan_str = f"{fmt(a)}/{fmt(r)}/{fmt(t)} ({int(total)})"
-        sv = p.get('source_version', 'none')
-        md.append(f"| {i} | {task['cr_key']} | {name} | {plan_str} | {sv} |")
+    md.append("# Снимок после jira-enricher\n")
+    md.append(f"**Дата:** {enriched['metadata'].get('enriched_at')}\n")
+    md.append(f"**Задач из плана:** {len(tasks)}\n")
+
+    found = sum(1 for t in tasks if (t.get('jira') or {}).get('found'))
+    not_found = sum(1 for t in tasks if t.get('jira') and not t['jira'].get('found'))
+    md.append(f"**Найдено в Jira:** {found}\n")
+    md.append(f"**Не найдено:** {not_found}\n")
+
+    # Сводка по категориям
+    md.append("\n## Сводка по статусам\n")
+    md.append("| Категория | Количество |")
+    md.append("|-----------|------------|")
+    from collections import Counter
+    cats = Counter(
+        (t.get('jira') or {}).get('status_category', 'no_data')
+        for t in tasks
+    )
+    for cat, n in cats.most_common():
+        md.append(f"| {cat} | {n} |")
+
+    # Таблица задач — колонка "Поток" (НЕ "Команда")
+    md.append("\n## Задачи\n")
+    md.append("| # | CR | Статус | Фаза | Эпик | Поток | Lead time |")
+    md.append("|---|-----|--------|------|------|-------|-----------|")
+    for i, task in enumerate(tasks, 1):
+        j = task.get('jira') or {}
+        status = j.get('status', '—')
+        phase = j.get('phase') or '—'
+        epic = j.get('epic') or {}
+        epic_str = '—'
+        if epic.get('key'):
+            ename = epic.get('name') or ''
+            ename = (ename[:25] + '…') if len(ename) > 25 else ename
+            epic_str = f"{epic['key']} {ename}".strip()
+        team_val = (j.get('team') or {}).get('value', '—') or '—'
+        lt = j.get('lead_time_days', '—')
+        lt_str = f"{lt} д" if isinstance(lt, int) else '—'
+        md.append(f"| {i} | {task['cr_key']} | {status} | {phase} | {epic_str} | {team_val} | {lt_str} |")
+
+    # Эпики
+    if epics:
+        md.append(f"\n## Уникальные эпики ({len(epics)})\n")
+        md.append("| Эпик | Имя | Задач из плана | Всего дочерних |")
+        md.append("|------|-----|----------------|-----------------|")
+        for e in epics:
+            ename = (e.get('name') or '')[:40]
+            from_plan = len(e.get('tasks_from_plan', []))
+            total = e.get('children_count_total')
+            total_str = str(total) if total is not None else '—'
+            md.append(f"| {e['key']} | {ename} | {from_plan} | {total_str} |")
+    else:
+        md.append("\n## Эпики\n*Эпики не агрегированы. Возможно агент пропустил шаг aggregate-epics.*")
+
     md.append("\n## Следующий шаг\n")
-    md.append("Запустить `jira-enricher` — добавит статусы, эпики, команды из Jira.")
-    with open(path, 'w', encoding='utf-8') as f:
+    md.append("Запустить `timing-analyzer` для расчёта факта А/Р/Т (опционально).")
+    md.append("Или сразу `report-builder` для финального отчёта.")
+
+    with open(md_path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(md))
 
-def now_iso() -> str:
-    """Текущее время в ISO 8601 с offset."""
-    return datetime.now(timezone.utc).astimezone().isoformat()
+    print(f"Created {md_path}")
+
+# === Main ===
+
+if __name__ == '__main__':
+    cmd = sys.argv[1] if len(sys.argv) > 1 else 'help'
+    if cmd == 'merge-batch':
+        merge_batch()
+    elif cmd == 'aggregate-epics':
+        aggregate_epics()
+    elif cmd == 'list-epics-to-count':
+        list_epics_to_count()
+    elif cmd == 'list-epics-without-names':
+        list_epics_without_names()
+    elif cmd == 'update-epic-children':
+        if len(sys.argv) < 4:
+            print("Usage: python3 helper.py update-epic-children <epic_key> <count>", file=sys.stderr)
+            sys.exit(1)
+        update_epic_children(sys.argv[2], sys.argv[3])
+    elif cmd == 'update-epic-name':
+        if len(sys.argv) < 4:
+            print("Usage: python3 helper.py update-epic-name <epic_key> <name>", file=sys.stderr)
+            sys.exit(1)
+        update_epic_name(sys.argv[2], sys.argv[3])
+    elif cmd == 'finalize':
+        finalize()
+    elif cmd == 'write-step2':
+        write_step2_markdown()
+    else:
+        print("Usage: python3 helper.py [merge-batch|aggregate-epics|list-epics-to-count|list-epics-without-names|update-epic-children KEY COUNT|update-epic-name KEY NAME|finalize|write-step2]")
+        sys.exit(1)
 ```
 
-**Главное про эти функции:**
-- Используют **только** `openpyxl`, никакого ручного XML-парсинга
-- Поиск колонок по **имени** (case-insensitive подстрока)
-- `parse_cr_key` использует **`re.search`** (не `match`/`fullmatch`)
-- Возвращают чистые значения, готовые к записи в json
+**Главное про этот код:**
+- `aggregate_epics()` — новая функция, собирает уникальные эпики из `task.jira.epic`. **Идемпотентна** — повторный вызов не теряет counters.
+- `update_epic_children(key, count)` — обновляет один эпик. Принимает аргументы через CLI, не stdin.
+- `list_epics_to_count` — выводит JSON-массив эпиков без counter (агент по ним делает jira_search)
+- `list_epics_without_names` — выводит эпики без имени (≤15 → значит можно догрузить)
+- Колонка в `write_step2_markdown` — **"Поток"**, не "Команда"
+- `extract_epic` использует `outward_issue` с подчёркиванием (как в Сбер-MCP)
 
-### Что ЗАПРЕЩЕНО
+## 10. Steps — что делает агент в чате
 
-- `main.py`, `process.py`, `run_*.py`, `generate_*.py`
-- `__pycache__/`, `requirements.txt`, `pyproject.toml`, виртуальные окружения
-- Любые `.py` файлы кроме одного `helper.py`
-- Запуск скилла как Python-приложения — SKILL.md остаётся главной точкой входа, `helper.py` это набор функций
+### Step 1. Валидация
 
-## 8. КРИТИЧНО: формат SKILL.md
-
-SKILL.md — это **инструкция для агента**, а не Python-скрипт. Каждый Step описан на естественном языке. Когда нужны вычисления — агент либо пишет inline `python3 -c '...'` через bash, либо импортирует функцию из `helper.py`.
-
-Пример **правильного** шага:
-```
-Шаг 2. Открыть Excel-файл.
-
-Импортировать `helper.py` (он рядом со SKILL.md в скиллах) и вызвать:
-  workbook = helper.open_workbook("Бэклог и цели.xlsx")
-  sheet = helper.get_sheet(workbook, "Q2_26_оценки_new_name")
-
-Если функция вернула ошибку — вывести сообщение пользователю и завершить.
+```bash
+python3 -c "
+import json
+d = json.load(open('pipeline/enriched.json'))
+assert 'excel-parser' in d['metadata']['skills_completed'], 'excel-parser не отработал'
+print(f'Tasks: {len(d[\"tasks\"])}')
+print('keys:', [t['cr_key'] for t in d['tasks']])
+"
 ```
 
-**Запрещено** в SKILL.md:
-- Полные Python-программы внутри инструкции
-- `# TODO`, `# здесь будет код`, заглушки
-- Описания вроде "напишите скрипт который..." — скилл сам описывает что делать
+Если файл не существует или excel-parser не в `skills_completed` — сообщить пользователю запустить предшественника.
 
-## 9. Guardrails
+### Step 2. Обработать задачи батчами по 5
 
-- READ-ONLY для Excel: только читаем, не модифицируем
-- Никаких MCP-вызовов
-- Только один python-файл: `helper.py`
-- Жёстко зафиксированы имя файла и лист
-- Не создаём `report.md` — это работа другого скилла
-- Не интерпретируем данные — только извлекаем
+Для каждых 5 cr_key из `tasks`:
 
-## 10. Edge cases
+**Step 2.1.** Для каждой задачи в батче — нативный tool call:
+```
+Tool: jira_get_issue
+key = <cr_key>
+fields = "summary,issuetype,status,project,created,updated,resolutiondate,reporter,assignee,priority,labels,description,parent,customfield_11400,customfield_22200,issuelinks"
+```
+
+Получить JSON, **глазами** извлечь поля (status.name, epic, team, и т.д.) — алгоритм согласно разделу 8 и `extract_jira_fields()` в helper.py.
+
+**Step 2.2.** Сформировать batch:
+```json
+[
+  {"cr_key": "CRSIGMA-26516", "jira": {найденные поля}},
+  {"cr_key": "ASFC-58741", "jira": {...}},
+  ...
+]
+```
+
+**Step 2.3.** Передать в helper:
+```bash
+echo '<batch_json>' | python3 ~/.gigacode/skills/jira-enricher/helper.py merge-batch
+```
+
+**Step 2.4.** Прогресс пользователю каждый батч: "Обработано 5/28".
+
+### Step 3. Агрегировать уникальные эпики (НОВОЕ в v3.2)
+
+После того как **все задачи** обработаны (все батчи `merge-batch` выполнены):
+
+```bash
+python3 ~/.gigacode/skills/jira-enricher/helper.py aggregate-epics
+```
+
+helper:
+- Прочитает все `task.jira.epic`
+- Соберёт уникальные эпики в `enriched.epics[]`
+- В каждом эпике укажет какие задачи плана к нему относятся (`tasks_from_plan`)
+- `children_count_total = None` (ещё не посчитано)
+
+**Если этот шаг пропустить — массив `enriched.epics[]` останется пустым, и в финальном отчёте секция эпиков будет пустой.** Это критический шаг, обязательный.
+
+### Step 4 (опционально). Догрузка имён эпиков
+
+Получить список эпиков без имени:
+```bash
+python3 ~/.gigacode/skills/jira-enricher/helper.py list-epics-without-names
+```
+
+Если список **не пустой** (значит их ≤15) — для каждого ключа:
+- Tool call `jira_get_issue(key=<epic_key>, fields="summary")`
+- Извлечь `fields.summary`
+- Обновить: `python3 helper.py update-epic-name <epic_key> "<имя>"`
+
+Если список пустой — пропустить шаг (либо все имена есть, либо эпиков >15).
+
+### Step 5. Подсчёт дочерних задач для каждого эпика
+
+Получить список эпиков для подсчёта:
+```bash
+python3 ~/.gigacode/skills/jira-enricher/helper.py list-epics-to-count
+```
+
+Для каждого `epic_key` из списка:
+
+**Step 5.1.** Tool call:
+```
+Tool: jira_search
+jql = '"Epic Link" = <epic_key>'
+fields = "summary,status,issuetype"
+maxResults = 100
+```
+
+**Step 5.2.** Получить `len(result.issues)` = N.
+
+**Step 5.3.** Обновить counter:
+```bash
+python3 ~/.gigacode/skills/jira-enricher/helper.py update-epic-children <epic_key> <N>
+```
+
+### Step 6. Финализация
+
+```bash
+python3 ~/.gigacode/skills/jira-enricher/helper.py finalize
+```
+
+helper обновит:
+- `metadata.enriched_at`
+- `metadata.skills_completed` добавит `"jira-enricher"`
+- `metadata.jira_stats` (сводная статистика)
+
+### Step 7. Создать markdown-снимок
+
+```bash
+python3 ~/.gigacode/skills/jira-enricher/helper.py write-step2
+```
+
+Создаст `pipeline/step-2-after-jira-enricher.md` с колонкой **"Поток"** (не "Команда") и секцией уникальных эпиков с counter дочерних.
+
+### Step 8. Сводка пользователю
+
+В чат:
+- Обработано задач: X из Y (M не найдены)
+- Уникальных эпиков: N (M с counter, K без)
+- Создан `pipeline/step-2-after-jira-enricher.md`
+- Следующий шаг: запустите `timing-analyzer` (для факта А/Р/Т) или сразу `report-builder`
+
+## 11. КРИТИЧНО: правильная последовательность шагов
+
+```
+для каждых 5 задач: tool calls jira_get_issue → echo batch | helper.py merge-batch
+после всех:        helper.py aggregate-epics  ← БЕЗ ЭТОГО ШАГА epics[] ПУСТОЙ
+для каждого эпика: tool call jira_search → helper.py update-epic-children <key> <count>
+финал:             helper.py finalize → helper.py write-step2
+```
+
+**Главный антипаттерн v3.1:** скилл делал tool calls и merge-batch правильно, но **пропускал aggregate-epics** — массив `enriched.epics` оставался пустым. В v3.2 этот шаг явный и обязательный.
+
+## 12. Файлы которые скилл может создавать
+
+| Файл | Назначение |
+|------|------------|
+| `pipeline/enriched.json` | Перезаписывается с дополнениями (jira-поля + epics массив) |
+| `pipeline/step-2-after-jira-enricher.md` | Читаемый snapshot с колонкой "Поток" |
+| `helper.py` (в `~/.gigacode/skills/jira-enricher/`) | CLI с подкомандами |
+
+### Запрещённые файлы
+
+Только `helper.py`. Никаких `main.py`, `process.py`, `run_*.py`, `generate_*.py`, `__pycache__`, виртуальных окружений.
+
+## 13. Guardrails
+
+- READ-ONLY для Jira
+- Точные `fields=` из раздела 6, не `fields="*"`
+- НЕ запрашивать changelog
+- НЕ ходить за дочерними задачами эпика дальше counter
+- Не падать на одной ошибке Jira
+- Колонка в step-2 — **"Поток"**, не "Команда"
+
+## 14. Edge cases
 
 | Ситуация | Поведение |
 |----------|-----------|
-| Файл `Бэклог и цели.xlsx` не найден | Сообщить точное имя, завершить |
-| Лист `Q2_26_оценки_new_name` не найден | Перечислить доступные листы, завершить |
-| В строке заголовков нет колонки `cr` | Сообщить "не найдена колонка с заголовком 'CR'", показать какие заголовки нашли, завершить |
-| Ни в одной строке нет CR-ключа | Сообщить "не найдены CR-ключи в файле", завершить |
-| Строка с пустой колонкой `cr` | Пропустить, **НЕ** добавлять в skipped_rows (нормальный случай) |
-| Строка с мусором в колонке `cr` (например "TBD" или "?") | skipped_rows с пометкой "не удалось распознать CR в строке N" |
-| Строка с OCRED-ключом но без CR-ключа в колонке `cr` | Пропустить — OCRED это отдельный трекер, не Jira которую обрабатываем. Не в skipped_rows. |
-| Дубликат CR-ключа в плане (как `CRSIGMA-22127` в Q2) | Обе строки добавляются как отдельные задачи. В `metadata.duplicates` отметка |
-| Колонки v2 (вторая позиция А/Р/Т) пустые но v1 (первая позиция) заполнены | Используем v1 версию плана, `source_version = "v1"` |
-| Все версии плана пустые | `plan` с null полями, `source_version = "none"`, задача всё равно в tasks |
-| Excel содержит несколько листов | Используем только `Q2_26_оценки_new_name`, остальные игнорируем |
-| Заголовки в строке 2, а не 1 | Логика поиска по 'cr' справится — header_row будет = 2 |
+| `pipeline/enriched.json` не существует | Попросить запустить excel-parser, завершить |
+| `excel-parser` не в `skills_completed` | То же |
+| Задача 404 в Jira | `jira = {found: false, error: "404"}`, продолжить |
+| Jira timeout | Записать error, продолжить со следующей задачей |
+| Статус не в mapping | `category = "unknown"`, `phase = null` |
+| `customfield_11400` пустой и нет issuelinks "Implement in" | `epic = {key: null, ...}` — эпика нет |
+| `customfield_22200` пустой и assignee пустой | `team = {value: null, ...}` |
+| `customfield_22200` пришёл как объект, не массив | `extract_team` пытается оба формата |
+| Несколько задач указывают на один эпик | `aggregate-epics` соберёт уникальный, `tasks_from_plan` будет с обеими |
+| Дочерних у эпика 0 | `children_count_total = 0`, валидно |
+| `jira_search` вернул ошибку | НЕ вызывать update-epic-children для этого ключа — пометить в metadata |
+| `jira_search` вернул >100 | `update-epic-children <key> 100`, в metadata jira_stats отметить |
+| Повторный запуск (idempotency) | Поля перезаписываются, но `aggregate-epics` сохраняет существующие counters |
+| `update-epic-children` для несуществующего эпика | helper падает с понятной ошибкой — значит aggregate-epics не вызывали |
 
-## 11. Антипаттерны
+## 15. Антипаттерны
 
-### Критические (приводили к багам в прошлых итерациях)
+### Критические (приводили к багам)
 
-- **Ручной парсинг xlsx как XML.** В прошлой попытке (v3 pmp-vs-jira) GigaCode распаковал xlsx как zip и парсил `xl/worksheets/sheet*.xml` вручную через `findall('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}c')`. **Результат:** колонки поехали (пустые ячейки в XML пропускаются, индексы сдвигаются). Из 28 задач нашлось 3. **Использовать ТОЛЬКО `openpyxl.load_workbook()`** — он сам нормализует пропуски через атрибут `r="B3"`.
-
-- **Жёсткая привязка к буквам колонок (B, C, F, G, ...).** При ручном XML-парсинге это особенно опасно. Даже с openpyxl — менее надёжно чем поиск по имени заголовка. **Всегда искать по имени** (case-insensitive, по подстроке) — это проверено в v2 `pmp-vs-jira-light` и дало 28 задач.
-
-- **Создание лишних .py файлов** (`main.py`, `process.py`, `generate_*.py`, `run_*.py`) — в прошлой v3 GigaCode создал 4 файла и pipeline поломался. **Только** `helper.py`. Никаких `__pycache__`, `requirements.txt`, виртуальных окружений.
-
-- **Заглушки в SKILL.md** (`# здесь будет парсинг`, `# TODO`) — SKILL.md должен быть готов к работе сразу, без TODO.
+- **Пропустить шаг `aggregate-epics`** — массив `enriched.epics[]` останется пустым → секция эпиков в финальном отчёте будет пустой. ЭТО БЫЛ КОРНЕВОЙ БАГ v3.1.
+- **Вызвать MCP из Python** — NameError
+- **Использовать `fields="*"`** — раздувает контекст
+- **Запрашивать `expand=changelog`** — это работа timing-analyzer
+- **Передавать batch через CLI-аргумент** — длина ограничена, только stdin
+- **Создавать `main.py`, `process.py`, run_*.py** — только `helper.py`
+- **В step-2-after-jira-enricher.md колонка "Команда"** — должно быть "Поток"
 
 ### Обычные
 
-- Записывать в `enriched.json` сырой ответ openpyxl без очистки текста (`\n`, `\r`)
-- Падать на одной плохой строке вместо `skipped_rows`
-- Не создавать `pipeline/` если её нет (нужно `os.makedirs(..., exist_ok=True)`)
-- Использовать `re.match` или `re.fullmatch` для CR-ключа — нужен `re.search` (потому что ключ может быть в URL, не в начале строки)
-- Сохранять JSON без `ensure_ascii=False` — кириллица превратится в `\u...`
-- Считать source_version как "v2" если только R/S/T пусты — нужно проверять что **хотя бы одна v2-позиция была не пуста**
+- Падать на одной 404 вместо записи `found: false` и продолжения
+- Параллельные вызовы MCP — только последовательно
+- Перезаписывать `enriched.json` без `ensure_ascii=False`
+- Хранить сырой JSON ответа MCP — только извлечённые поля
 
-## 12. Критерий успеха
+## 16. Критерий успеха
 
 После запуска:
-1. Файл `pipeline/enriched.json` создан и валиден (структура совпадает с CONTRACT.md)
-2. Количество задач в массиве `tasks` соответствует количеству CR-ключей в Excel
-3. У каждой задачи заполнены `cr_key`, `task_name`, `initiative`, `plan`
-4. `metadata.skills_completed = ["excel-parser"]`
-5. В чате выведена сводка
-6. Никаких лишних файлов в рабочей директории
+1. `pipeline/enriched.json` перезаписан, валиден
+2. У каждой задачи поле `jira` заполнено
+3. **Массив `epics` непустой** (если у задач есть эпики) — ЭТО КЛЮЧЕВАЯ ПРОВЕРКА для v3.2
+4. У каждого эпика заполнено `tasks_from_plan` и `children_count_total`
+5. `metadata.skills_completed` содержит `["excel-parser", "jira-enricher"]`
+6. Создан `pipeline/step-2-after-jira-enricher.md` с колонкой "Поток"
+7. В чате сводка с реальными цифрами
 
-## 13. Что отложено на следующие версии
+**Быстрая проверка после прогона:**
+```bash
+python3 -c "
+import json
+d = json.load(open('pipeline/enriched.json'))
+print('Tasks:', len(d['tasks']))
+print('Tasks with jira:', sum(1 for t in d['tasks'] if (t.get('jira') or {}).get('found')))
+print('Epics:', len(d.get('epics', [])))  # ДОЛЖНО БЫТЬ > 0
+for e in d.get('epics', [])[:3]:
+    print(f'  {e[\"key\"]}: from_plan={len(e[\"tasks_from_plan\"])} children={e[\"children_count_total\"]}')
+"
+```
 
-- v3.1: парсить лист `Q1_26_PMP` (если попросят)
-- v4: парсить дополнительные колонки с плановыми датами ИФТ/ПСИ/ПРОМ из Excel (если они там есть)
+Если `Epics: 0` — значит шаг `aggregate-epics` пропущен. Запустить вручную:
+```bash
+python3 ~/.gigacode/skills/jira-enricher/helper.py aggregate-epics
+python3 ~/.gigacode/skills/jira-enricher/helper.py write-step2
+```
+
+## 17. Что отложено
+
+- v4: догрузка плановых дат ИФТ/ПСИ/ПРОМ (отдельный скилл `dates-enricher` после jira-enricher)
+- v6: получать **каждую** дочернюю задачу эпика с её планом, не только counter
